@@ -1,0 +1,20 @@
+# Copy to config.toml and adjust. config.toml is git-ignored.
+
+# Directories are scanned recursively. Overlapping entries are fine; each file is
+# indexed once. Directories on external drives that are not mounted are skipped
+# and their tracks are left untouched (not marked missing).
+music_directories = [
+    "~/Music/DJ",
+    "/Volumes/MusicSSD/Tracks",
+]
+
+# Relative paths are resolved against the directory containing this file.
+database_path = "./data/library.sqlite3"
+
+# Optional. Changing any of these produces a new analyzer version, so affected
+# tracks become pending for `hades analyze` again.
+[analysis]
+sample_rate = 44100            # all audio is resampled to this rate before analysis
+bpm_method = "multifeature"    # Essentia RhythmExtractor2013: "multifeature" or "degara"
+key_profile = "edma"           # Essentia KeyExtractor profile; "edma" is tuned for electronic music
+max_duration_seconds = 1800    # longer files (e.g. DJ mixes) are skipped to bound memory use
