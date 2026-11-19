@@ -175,7 +175,7 @@ def spec_answer(**spec) -> dict:
     """An interpretation answer in the LLM's wire format (all fields present)."""
     full = {"genre": [], "created_after": None, "created_before": None, "bpm": None,
             "duration_minutes": None, "duration_mode": None, "duration_tolerance_minutes": None,
-            "track_count": None, "folder": None, "artists": [], "exclude_artists": [],
+            "track_count": None, "folder": None, "artists": [], "exclude_artists": [], "max_tracks_per_artist": None,
             "ordering": {"bpm_progression": "none", "harmonic_compatibility": False}}
     full.update(spec)
     return {"error": None, "spec": full}

@@ -60,6 +60,7 @@ def save_playlist(conn: sqlite3.Connection, playlist: Playlist) -> None:
         raise RepositoryError(f"could not save the playlist: {exc}") from None
     playlist.id = playlist_id
     playlist.dirty = False
+    playlist.saved_name = playlist.name
 
 
 def list_playlists(conn: sqlite3.Connection) -> list[PlaylistSummary]:
@@ -87,6 +88,6 @@ def load_playlist(conn: sqlite3.Connection, name: str) -> Playlist:
             spec = None  # parameters are kept for reference only; an old format is not fatal
     return Playlist(
         name=row["name"], id=row["id"], prompt=row["original_prompt"], spec=spec,
-        status=row["generation_status"], named=True, dirty=False,
+        status=row["generation_status"], named=True, dirty=False, saved_name=row["name"],
         entries=[Entry(tracks[r["track_id"]], r["added_at"]) for r in items],
     )

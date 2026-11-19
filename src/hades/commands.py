@@ -18,7 +18,7 @@ class CommandError(ValueError):
 @dataclass(frozen=True)
 class Command:
     action: str                 # name | rename | move | remove | add | save | playlists | open | ...
-    text: str | None = None     # name argument
+    text: str | None = None     # name or path argument
     track_id: int | None = None
     position: int | None = None
 
@@ -32,12 +32,15 @@ USAGE = {
     "save": "save",
     "playlists": "playlists",
     "open": "open <playlist name>",
+    "export": "export [file or folder]",
+    "again": "again",
     "refine": "refine",
     "new": "new",
     "help": "help",
 }
 
-_ALIASES = {"rm": "remove", "delete": "remove", "ls": "playlists", "load": "open", "?": "help"}
+_ALIASES = {"rm": "remove", "delete": "remove", "ls": "playlists", "load": "open", "?": "help",
+            "regenerate": "again", "retry": "again"}
 
 _MOVE = re.compile(r"(\d+)\s+(?:to\s+)?(\d+)", re.IGNORECASE)
 _ADD = re.compile(r"(\d+)(?:\s+(?:at\s+)?(\d+))?", re.IGNORECASE)
@@ -61,7 +64,9 @@ def parse_command(text: str) -> Command | None:
         if not rest:
             raise fail()
         return Command(action, text=rest)
-    if action in ("save", "playlists", "refine", "new", "help"):
+    if action == "export":
+        return Command(action, text=rest or None)
+    if action in ("save", "playlists", "again", "refine", "new", "help"):
         if rest:
             raise fail()
         return Command(action)

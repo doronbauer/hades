@@ -182,7 +182,7 @@ INTERPRET_SCHEMA: dict[str, Any] = {
             "additionalProperties": False,
             "required": ["genre", "created_after", "created_before", "bpm", "duration_minutes",
                          "duration_mode", "duration_tolerance_minutes", "track_count", "folder",
-                         "artists", "exclude_artists", "ordering"],
+                         "artists", "exclude_artists", "max_tracks_per_artist", "ordering"],
             "properties": {
                 "genre": _STRINGS,
                 "created_after": _nullable({"type": "string", "format": "date"}),
@@ -201,6 +201,7 @@ INTERPRET_SCHEMA: dict[str, Any] = {
                 "folder": _nullable({"type": "string"}),
                 "artists": _STRINGS,
                 "exclude_artists": _STRINGS,
+                "max_tracks_per_artist": _nullable({"type": "integer"}),
                 "ordering": {
                     "type": "object",
                     "additionalProperties": False,
@@ -237,6 +238,9 @@ mode "max". duration_tolerance_minutes: only if the user states one, else null.
 - track_count: only if a number of tracks is requested.
 - folder: a directory name or path, only if the user restricts to one.
 - artists / exclude_artists: only artists the user names.
+- max_tracks_per_artist: only if the user limits repeats: "one track per artist", "no \
+artist twice", "every track by a different artist" -> 1; "at most 2 per artist" -> 2. \
+Otherwise null (consecutive tracks by the same artist are avoided anyway).
 - ordering.bpm_progression: "ascending" for increasing tempo, "starting slow and getting \
 faster", "build up"; "descending" for the reverse; otherwise "none".
 - ordering.harmonic_compatibility: true if the user asks for harmonic/key-compatible/\

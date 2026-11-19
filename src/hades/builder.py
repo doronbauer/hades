@@ -18,7 +18,9 @@ playlist.
 
 from __future__ import annotations
 
+import random
 import statistics
+from collections import Counter
 from dataclasses import dataclass, field
 
 from hades.keys import harmonic_compatibility
@@ -30,6 +32,11 @@ NEUTRAL_KEY_SCORE = 0.35       # unknown/unreliable key: below any "compatible" 
 GOOD_KEY_SCORE = 0.5           # at or above: a transition counts as harmonic
 MAX_BPM_STEP_PCT = 6.0         # a bigger tempo change counts as a jump
 ATTEMPTS = 8                   # starting tracks tried
+SAME_ARTIST_PENALTY = 1.5      # back-to-back tracks sharing an artist
+SAME_ALBUM_PENALTY = 1.0       # back-to-back tracks from the same album
+REPEAT_ARTIST_PENALTY = 0.6    # per earlier track by the same artist anywhere in the set
+AVOID_PENALTY = 0.3            # tracks of the previous attempt, when asked to try again
+VARIATION = 0.2                # max random bonus per step when a seed is given
 
 
 @dataclass(frozen=True)
@@ -114,6 +121,14 @@ def transition(a: Track, b: Track, ordering: Ordering) -> Transition:
         elif not direction:
             score -= abs(pct) / 20  # mild preference for steady tempo
 
+    shared = a.artist_names & b.artist_names
+    if shared:
+        score -= SAME_ARTIST_PENALTY
+        issues.append("same artist")
+    elif a.album_key is not None and a.album_key == b.album_key:
+        score -= SAME_ALBUM_PENALTY
+        issues.append("same album")
+
     if ordering.harmonic_compatibility:
         k = key_score(a, b)
         score += k
@@ -148,6 +163,11 @@ def validate(tracks: list[Track], spec: PlaylistSpec) -> list[str]:
         seen.add(t.id)
         for v in track_violations(t, spec):
             out.append(f"#{pos} (ID {t.id}): {v}")
+    if spec.max_tracks_per_artist is not None:
+        counts = Counter(n for t in tracks for n in t.artist_names)
+        for name, n in sorted(counts.items()):
+            if n > spec.max_tracks_per_artist:
+                out.append(f"{n} tracks by {name} (at most {spec.max_tracks_per_artist})")
     if spec.track_count is not None and len(tracks) != spec.track_count:
         out.append(f"{len(tracks)} tracks instead of the requested {spec.track_count}")
     lo, hi = spec.duration_bounds_seconds
@@ -214,13 +234,14 @@ def _bpm_plan(pool: list[Track], spec: PlaylistSpec, n: int) -> list[float] | No
 
 class _Attempt:
     def __init__(self, start: Track, pool: list[Track], spec: PlaylistSpec, targets: _Targets,
-                 plan: list[float] | None) -> None:
+                 plan: list[float] | None, rng: random.Random | None,
+                 avoid: frozenset[int]) -> None:
         self.spec, self.targets, self.plan = spec, targets, plan
-        self.pool = pool
+        self.pool, self.rng, self.avoid = pool, rng, avoid
         self.seq: list[Track] = []
         self.used: set[int] = set()
         self.identities: set[tuple[str, str]] = set()
-        self.artists: dict[str, int] = {}
+        self.artists: Counter[str] = Counter()
         self.total = 0.0
         self.score = 0.0
         self._add(start, 0.0)
@@ -230,14 +251,15 @@ class _Attempt:
         self.used.add(t.id)
         if (ident := _identity(t)) is not None:
             self.identities.add(ident)
-        if t.artist:
-            a = normalize_text(t.artist)
-            self.artists[a] = self.artists.get(a, 0) + 1
+        self.artists.update(t.artist_names)
         self.total += t.duration or 0.0
         self.score += score
 
     def _usable(self, t: Track) -> bool:
-        return t.id not in self.used and _identity(t) not in self.identities
+        if t.id in self.used or _identity(t) in self.identities:
+            return False
+        limit = self.spec.max_tracks_per_artist
+        return limit is None or all(self.artists[n] < limit for n in t.artist_names)
 
     def done(self) -> bool:
         if self.targets.count is not None:
@@ -257,17 +279,21 @@ class _Attempt:
                 return False
         return True
 
-    def _candidate_score(self, t: Track) -> float:
+    def _next_to_last_ok(self, t: Track) -> bool:
+        """No shared artist and no shared album with the previous track."""
         last = self.seq[-1]
-        score = transition(last, t, self.spec.ordering).score
+        if t.artist_names & last.artist_names:
+            return False
+        return t.album_key is None or t.album_key != last.album_key
+
+    def _candidate_score(self, t: Track) -> float:
+        score = transition(self.seq[-1], t, self.spec.ordering).score
         if self.plan is not None and t.bpm is not None:
             idx = min(len(self.seq), len(self.plan) - 1)
             score -= abs(t.bpm - self.plan[idx]) / max(self.plan[idx], 1) * 100 / 4
-        if t.artist:
-            a = normalize_text(t.artist)
-            if last.artist and normalize_text(last.artist) == a:
-                score -= 1.5
-            score -= 0.4 * self.artists.get(a, 0)
+        score -= REPEAT_ARTIST_PENALTY * max((self.artists[n] for n in t.artist_names), default=0)
+        if t.id in self.avoid:
+            score -= AVOID_PENALTY
         return score
 
     def grow(self) -> None:
@@ -284,8 +310,15 @@ class _Attempt:
                            if hi is None or self.total + (t.duration or 0.0) <= hi]
                 if not fitting:
                     return
-            best = max(fitting, key=lambda t: (self._candidate_score(t), -t.id))
-            self._add(best, self._candidate_score(best))
+            # Same artist or album back to back only when nothing else fits.
+            fitting = [t for t in fitting if self._next_to_last_ok(t)] or fitting
+            scored = []
+            for t in fitting:
+                base = self._candidate_score(t)
+                bonus = self.rng.uniform(0, VARIATION) if self.rng else 0.0
+                scored.append((base + bonus, -t.id, base, t))
+            _, _, base, best = max(scored, key=lambda x: (x[0], x[1]))
+            self._add(best, base)
 
     def rank(self) -> tuple[float, ...]:
         violations = validate(self.seq, self.spec)
@@ -293,18 +326,68 @@ class _Attempt:
         return (-len(violations), len(self.seq) if self.targets.count else 0, mean)
 
 
-def _starts(pool: list[Track], plan: list[float] | None) -> list[Track]:
+def _neighbours_clash(a: Track, b: Track) -> bool:
+    return bool(a.artist_names & b.artist_names) or (
+        a.album_key is not None and a.album_key == b.album_key)
+
+
+def separate_neighbours(tracks: list[Track], ordering: Ordering) -> list[Track]:
+    """Reorder (by swapping pairs) so fewer neighbours share an artist or album.
+
+    Greedy building can leave tracks of one artist for the end, where they have to
+    sit together. A swap is made only if it reduces the number of such neighbours;
+    among those, the one with the smoothest transitions wins.
+    """
+    seq = list(tracks)
+
+    def clashes(s: list[Track]) -> int:
+        return sum(_neighbours_clash(a, b) for a, b in zip(s, s[1:]))
+
+    def smoothness(s: list[Track]) -> float:
+        return sum(t.score for t in transitions(s, ordering))
+
+    current = clashes(seq)
+    while current:
+        best: tuple[int, float, list[Track]] | None = None
+        for i in range(len(seq)):
+            for j in range(i + 1, len(seq)):
+                trial = list(seq)
+                trial[i], trial[j] = trial[j], trial[i]
+                n = clashes(trial)
+                if n < current:
+                    key = (n, smoothness(trial))
+                    if best is None or (-key[0], key[1]) > (-best[0], best[1]):
+                        best = (key[0], key[1], trial)
+        if best is None:
+            break
+        current, seq = best[0], best[2]
+    return seq
+
+
+def _starts(pool: list[Track], plan: list[float] | None,
+            rng: random.Random | None) -> list[Track]:
     if plan is not None:
         first = plan[0]
         ranked = sorted(pool, key=lambda t: (abs((t.bpm if t.bpm is not None else 1e9) - first),
                                              t.id))
-        return ranked[:ATTEMPTS]
-    by_bpm = sorted(pool, key=lambda t: (t.bpm if t.bpm is not None else 1e9, t.id))
-    step = max(len(by_bpm) // ATTEMPTS, 1)
-    return by_bpm[::step][:ATTEMPTS]
+    else:
+        by_bpm = sorted(pool, key=lambda t: (t.bpm if t.bpm is not None else 1e9, t.id))
+        step = max(len(by_bpm) // (ATTEMPTS * 3), 1)
+        ranked = by_bpm[::step]
+    if rng is None:
+        return ranked[:ATTEMPTS] if plan is not None else ranked[::3][:ATTEMPTS]
+    choices = ranked[:ATTEMPTS * 3]
+    return rng.sample(choices, min(ATTEMPTS, len(choices)))
 
 
-def build_playlist(requested: PlaylistSpec, pool: CandidatePool) -> BuildResult:
+def build_playlist(requested: PlaylistSpec, pool: CandidatePool, *, seed: int | None = None,
+                   avoid: frozenset[int] = frozenset()) -> BuildResult:
+    """Build a playlist. The same inputs always give the same result.
+
+    ``seed`` adds bounded randomness so that a repeated request yields a different
+    (still valid) playlist; ``avoid`` softly steers away from given track IDs.
+    """
+    rng = random.Random(seed) if seed is not None else None
     spec, defaults = apply_defaults(requested)
     targets = _targets(spec)
     candidates = list(pool.tracks)
@@ -325,10 +408,10 @@ def build_playlist(requested: PlaylistSpec, pool: CandidatePool) -> BuildResult:
     plan = _bpm_plan(candidates, spec, n_est)
 
     best: _Attempt | None = None
-    for start in _starts(candidates, plan):
+    for start in _starts(candidates, plan, rng):
         if targets.hi is not None and (start.duration or 0) > targets.hi:
             continue
-        attempt = _Attempt(start, candidates, spec, targets, plan)
+        attempt = _Attempt(start, candidates, spec, targets, plan, rng, avoid)
         attempt.grow()
         if best is None or attempt.rank() > best.rank():
             best = attempt
@@ -336,13 +419,39 @@ def build_playlist(requested: PlaylistSpec, pool: CandidatePool) -> BuildResult:
         result.unsatisfied.append("every matching track is longer than the duration limit")
         return result
 
-    result.tracks = best.seq
+    result.tracks = separate_neighbours(best.seq, spec.ordering)
     # Only what the user asked for can be unmet; missing a default length is a warning.
-    result.unsatisfied.extend(validate(best.seq, requested))
+    result.unsatisfied.extend(validate(result.tracks, requested))
     result.warnings.extend(f"default length not reached: {v}"
-                           for v in validate(best.seq, spec) if v not in result.unsatisfied)
-    result.warnings.extend(quality_warnings(best.seq, spec))
+                           for v in validate(result.tracks, spec) if v not in result.unsatisfied)
+    result.warnings.extend(quality_warnings(result.tracks, spec))
     return result
+
+
+def build_variation(requested: PlaylistSpec, pool: CandidatePool, previous: list[int],
+                    seed: int, tries: int = 12) -> BuildResult:
+    """A different playlist for the same request, for "try again".
+
+    Builds several seeded variants that softly avoid ``previous`` and returns the
+    best one (fewest unmet constraints, then smoothest transitions) among those
+    replacing at least half of the previous tracks; if none does, the most different.
+    """
+    avoid = frozenset(previous)
+    rng = random.Random(seed)
+    variants = [build_playlist(requested, pool, seed=rng.randrange(2**31), avoid=avoid)
+                for _ in range(tries)]
+
+    def overlap(r: BuildResult) -> int:
+        return sum(1 for t in r.tracks if t.id in avoid)
+
+    def quality(r: BuildResult) -> tuple[float, ...]:
+        smooth = sum(t.score for t in transitions(r.tracks, r.effective_spec.ordering))
+        return (-len(r.unsatisfied), smooth / max(len(r.tracks) - 1, 1))
+
+    fresh = [r for r in variants if overlap(r) * 2 <= len(avoid)]
+    if fresh:
+        return max(fresh, key=quality)
+    return min(variants, key=lambda r: (overlap(r), [-q for q in quality(r)]))
 
 
 def quality_warnings(tracks: list[Track], spec: PlaylistSpec) -> list[str]:

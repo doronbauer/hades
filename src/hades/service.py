@@ -6,14 +6,23 @@ No UI code here, so the CLI and the terminal app share it.
 
 from __future__ import annotations
 
+import random
 import sqlite3
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 
-from hades.builder import BuildResult, build_playlist, fmt_duration
+from hades.builder import BuildResult, build_playlist, build_variation, fmt_duration
+from hades.export import DEFAULT_EXTENSION, export_filename, export_m3u, remove_export
 from hades.llm import LLMClient, interpret_request
+from hades.playlist import Playlist
 from hades.query import CandidatePool, find_candidates
+from hades.repository import save_playlist
 from hades.spec import PlaylistSpec
+
+
+class ExportError(Exception):
+    """The playlist was saved in the database, but the playlist file could not be written."""
 
 
 @dataclass
@@ -36,6 +45,35 @@ def generate(conn: sqlite3.Connection, request: str, client: LLMClient,
     gen.pool = find_candidates(conn, gen.spec)
     gen.result = build_playlist(gen.spec, gen.pool)
     return gen
+
+
+def generate_again(conn: sqlite3.Connection, playlist: Playlist,
+                   seed: int | None = None) -> BuildResult:
+    """Rebuild a generated playlist's request (no LLM call), preferring other tracks."""
+    if playlist.spec is None:
+        raise ValueError("this playlist was not generated from a request, so there is "
+                         "nothing to run again")
+    pool = find_candidates(conn, playlist.spec)
+    seed = random.randrange(2**31) if seed is None else seed
+    return build_variation(playlist.spec, pool, [t.id for t in playlist.tracks], seed)
+
+
+def save_and_export(conn: sqlite3.Connection, playlist: Playlist, export_dir: Path,
+                    extension: str = DEFAULT_EXTENSION) -> Path:
+    """Save to the database, then write ``<export_dir>/<name><extension>``; return the file path.
+
+    After a rename, the file written under the previous name is removed.
+    """
+    previous = playlist.saved_name
+    save_playlist(conn, playlist)
+    try:
+        path = export_m3u(playlist, export_dir, extension)
+        if previous and export_filename(previous) != export_filename(playlist.name):
+            remove_export(previous, export_dir, extension)
+    except OSError as exc:
+        raise ExportError(f"saved “{playlist.name}” in the database, but could not write the "
+                          f"playlist file in {export_dir}: {exc.strerror or exc}") from None
+    return path
 
 
 def report_lines(result: BuildResult) -> list[str]:

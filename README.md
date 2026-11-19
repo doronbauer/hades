@@ -20,7 +20,9 @@ Library commands: `hades scan`, `analyze`, `reconcile`, `stats`, `inspect`, `sea
 hades ui                                   # interactive terminal app
 hades generate "a one-hour drum & bass set below 160 BPM, added after March 2026"
 hades generate "15 techno tracks, 125-135 BPM, rising tempo" --refine --save "Peak"
+hades regenerate "Peak" [--save "Peak 2"]  # another version of the same request, no LLM call
 hades playlists [NAME]                     # list saved playlists, or show one
+hades playlists "Peak" --export [PATH]     # write it as a .m3u playlist file
 ```
 
 Requests are interpreted by an LLM configured under `[llm]` in `config.toml`:
@@ -48,8 +50,13 @@ BPM, keys, genres and durations are sent — never file paths or audio.
    starting tracks, picks each next track by transition score while keeping
    count/duration satisfiable. Tempo follows a planned ramp for ascending or
    descending requests; Camelot-wheel neighbours score high; missing or
-   unreliable keys get a neutral score; artists are varied and duplicate songs
-   skipped. The result is validated against every hard constraint.
+   unreliable keys get a neutral score; duplicate songs are skipped. The result
+   is validated against every hard constraint.
+   *Variety*: multi-artist credits are split into names ("Clark, Marcel Dettmann"
+   counts as both), and two neighbouring tracks never share an artist or an album
+   unless nothing else fits (e.g. a single-artist request). Repeating an artist
+   elsewhere in the set is allowed but penalized; ask for "one track per artist"
+   or "at most 2 per artist" to make it a hard limit.
 4. **Refinement** (optional, `refine` / `--refine`): the LLM may reorder or swap
    tracks from a bounded shortlist. The proposal is accepted only if it passes
    all hard constraints and scores at least as well as the current order.
@@ -72,7 +79,6 @@ Interpretation rules worth knowing:
 | ↑ / ↓ | select previous/next track and play it (playlist focused) |
 | Space | pause/resume |
 | M | toggle preview mode START (from 0:00) / MIDDLE (from 50%) for the next selection |
-| S | stop |
 | Tab | switch focus between playlist and prompt |
 | Enter | submit the prompt |
 | Ctrl+Q | quit |
@@ -85,7 +91,9 @@ Commands at the prompt (anything else is a natural-language request):
 | `move 876 to 4` | move track ID 876 to position 4 |
 | `remove 876` | remove track ID 876 |
 | `add 1042` / `add 1042 at 3` | append / insert a track by ID |
-| `save` | save (requires a name) |
+| `save` | save (requires a name) and write `<export_directory>/<name>.m3u` |
+| `export` / `export ~/Desktop/set.m3u` | write the current playlist file (default: export_directory) |
+| `again` | another version of the same request (no LLM call), preferring other tracks |
 | `playlists` | list saved playlists |
 | `open My Playlist` | load a saved playlist |
 | `new` | start an empty playlist |
@@ -94,8 +102,23 @@ Commands at the prompt (anything else is a natural-language request):
 
 Track IDs are the library's IDs (see `hades search`); positions start at 1.
 Manual edits may break the original request; the Notes column and the status
-line show what no longer holds. Replacing a playlist that has unsaved changes
-requires submitting the same input twice.
+line show what no longer holds. Replacing a playlist that has unsaved changes (with a
+new request, `again`, `open` or `new`) asks first: press Enter a second time to
+discard it.
+
+The columns show position, library ID, artist and title, BPM and key (`?` marks
+a value where tags and analysis disagree), length, the date the file was added
+to disk, and notes (transition problems and constraint violations).
+
+`again` rebuilds from the stored request with some randomness, steering away
+from the current tracks; it picks the smoothest of several variants that replace
+at least half of them. The result is a new, unsaved playlist; a saved one is kept.
+
+Saved playlists are written as extended M3U files (`.m3u`, UTF-8, absolute
+paths to your files), which Traktor 3, VLC, Music, Rekordbox and most players
+open. Set `playlist_format = "m3u8"` for players that prefer that extension.
+Renaming and saving replaces the old file. Set `export_directory` in
+`config.toml` (default `./exports`, which git ignores).
 
 Playlists are stored in the library database (`playlists`, `playlist_tracks`,
 added by schema migration 2). They reference tracks by ID and keep the

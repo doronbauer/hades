@@ -5,7 +5,7 @@ that (retrieval, sequencing, validation) is deterministic and works on a
 ``PlaylistSpec`` only.
 
 Hard constraints (never silently violated): dates, BPM limits, genres, folder,
-artists, an explicit track count, and total duration. Soft preferences (affect
+artists, a per-artist limit, an explicit track count, and total duration. Soft preferences (affect
 ordering only): BPM progression and harmonic compatibility, under ``ordering``.
 
 Dates are exclusive calendar bounds on the filesystem creation date, in local
@@ -67,6 +67,7 @@ class PlaylistSpec(BaseModel):
     folder: str | None = None
     artists: list[str] = Field(default_factory=list)          # only these artists
     exclude_artists: list[str] = Field(default_factory=list)
+    max_tracks_per_artist: int | None = Field(default=None, ge=1)  # None: repeats allowed
     ordering: Ordering = Field(default_factory=Ordering)
 
     @model_validator(mode="before")
@@ -141,6 +142,8 @@ class PlaylistSpec(BaseModel):
             out.append("artist: " + " or ".join(self.artists))
         if self.exclude_artists:
             out.append("excluding: " + ", ".join(self.exclude_artists))
+        if self.max_tracks_per_artist is not None:
+            out.append(f"at most {self.max_tracks_per_artist} per artist")
         return out
 
     def soft_preferences(self) -> list[str]:

@@ -14,6 +14,7 @@ from hades.db import connect
 from hades.progress import Progress
 
 if TYPE_CHECKING:
+    from hades.builder import BuildResult
     from hades.playlist import Playlist
 
 
@@ -79,11 +80,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("request", help='e.g. "a one-hour techno set with rising tempo"')
     p.add_argument("--refine", action="store_true",
                    help="let the LLM propose a better selection/order (re-validated)")
-    p.add_argument("--save", metavar="NAME", help="save the playlist under this name")
+    p.add_argument("--save", metavar="NAME",
+                   help="save the playlist under this name (also writes NAME.m3u)")
     p.set_defaults(handler=cmd_generate)
+
+    p = sub.add_parser("regenerate",
+                       help="build another version of a saved playlist's request (no LLM call)")
+    p.add_argument("name", help="saved playlist whose request to run again")
+    p.add_argument("--save", metavar="NAME", help="save the new version under this name")
+    p.set_defaults(handler=cmd_regenerate)
 
     p = sub.add_parser("playlists", help="list saved playlists, or show one")
     p.add_argument("name", nargs="?", help="playlist to show")
+    p.add_argument("--export", nargs="?", const="", metavar="PATH",
+                   help="write it as a playlist file (default: the configured export_directory)")
     p.set_defaults(handler=cmd_playlists)
 
     return parser
@@ -239,7 +249,8 @@ def cmd_ui(args: argparse.Namespace, config: Config, conn: sqlite3.Connection) -
     from hades.tui import HadesApp
 
     app = HadesApp(conn, config.database_path, lambda: make_client(config.llm),
-                   make_player(config.player.mpv_path))
+                   make_player(config.player.mpv_path), config.export_directory,
+                   config.export_extension)
     app.run()
     return 0
 
@@ -247,7 +258,6 @@ def cmd_ui(args: argparse.Namespace, config: Config, conn: sqlite3.Connection) -
 def cmd_generate(args: argparse.Namespace, config: Config, conn: sqlite3.Connection) -> int:
     from hades.llm import LLMError, make_client, refine_playlist
     from hades.playlist import Playlist
-    from hades.repository import RepositoryError, save_playlist
     from hades.service import generate, report_lines
 
     try:
@@ -267,21 +277,48 @@ def cmd_generate(args: argparse.Namespace, config: Config, conn: sqlite3.Connect
         return 2
 
     playlist = Playlist.from_result(result, args.request)
+    return _show_and_save(conn, config, playlist, result, args.save)
+
+
+def cmd_regenerate(args: argparse.Namespace, config: Config, conn: sqlite3.Connection) -> int:
+    from hades.repository import RepositoryError, load_playlist
+    from hades.playlist import Playlist
+    from hades.service import generate_again
+
+    try:
+        previous = load_playlist(conn, args.name)
+        result = generate_again(conn, previous)
+    except (RepositoryError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return _show_and_save(conn, config, Playlist.from_result(result, previous.prompt), result,
+                          args.save)
+
+
+def _show_and_save(conn: sqlite3.Connection, config: Config, playlist: Playlist,
+                   result: BuildResult, save_as: str | None) -> int:
+    from hades.repository import RepositoryError
+    from hades.service import ExportError, report_lines, save_and_export
+
     _print_playlist(playlist)
     print()
     print("\n".join(report_lines(result)))
-    if args.save:
-        playlist.rename(args.save)
+    if save_as:
+        playlist.rename(save_as)
         try:
-            save_playlist(conn, playlist)
-        except RepositoryError as exc:
+            path = save_and_export(conn, playlist, config.export_directory,
+                                   config.export_extension)
+        except (RepositoryError, ExportError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        print(f"Saved as {playlist.name!r}")
+        print(f"Saved as {playlist.name!r} → {path}")
     return 0 if not result.unsatisfied else 3
 
 
 def cmd_playlists(args: argparse.Namespace, config: Config, conn: sqlite3.Connection) -> int:
+    from pathlib import Path
+
+    from hades.export import export_m3u
     from hades.repository import RepositoryError, list_playlists, load_playlist
 
     if args.name:
@@ -294,7 +331,17 @@ def cmd_playlists(args: argparse.Namespace, config: Config, conn: sqlite3.Connec
         _print_playlist(playlist)
         for v in playlist.violations():
             print(f"  WARNING  {v}")
+        if args.export is not None:
+            target = Path(args.export).expanduser() if args.export else config.export_directory
+            try:
+                print(f"Exported → {export_m3u(playlist, target, config.export_extension)}")
+            except OSError as exc:
+                print(f"error: could not write {target}: {exc.strerror or exc}", file=sys.stderr)
+                return 1
         return 0
+    if args.export is not None:
+        print("error: --export needs a playlist name", file=sys.stderr)
+        return 2
     items = list_playlists(conn)
     if not items:
         print("No saved playlists.")
@@ -311,7 +358,9 @@ def _print_playlist(playlist: Playlist) -> None:
         bpm = f"{t.bpm:.0f}" if t.bpm is not None else "-"
         key = t.camelot or "-"
         time = fmt_duration(t.duration) if t.duration else "-"
+        added = t.created_date.isoformat() if t.created_date else "-"
         note = f"  [{', '.join(tr)}]" if tr else ""
-        print(f"{pos:>3}  {t.id:>6}  {t.display[:50]:<50}  {bpm:>4}  {key:>3}  {time:>6}{note}")
+        print(f"{pos:>3}  {t.id:>6}  {t.display[:50]:<50}  {bpm:>4}  {key:>3}  {time:>6}  "
+              f"{added:>10}{note}")
     s = playlist.stats
     print(f"{s.count} tracks | {fmt_duration(s.total_seconds)} total | {s.bpm_range}")

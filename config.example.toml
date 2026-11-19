@@ -11,6 +11,12 @@ music_directories = [
 # Relative paths are resolved against the directory containing this file.
 database_path = "./data/library.sqlite3"
 
+# Saved playlists are also written here as playlist files (absolute track paths),
+# which music players and DJ software can open. playlist_format: "m3u" (works in
+# Traktor 3) or "m3u8". Both are UTF-8.
+export_directory = "./exports"
+playlist_format = "m3u"
+
 # Optional. Changing any of these produces a new analyzer version, so affected
 # tracks become pending for `hades analyze` again.
 [analysis]

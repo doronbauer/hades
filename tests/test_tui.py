@@ -71,7 +71,7 @@ def log_text(app: HadesApp) -> str:
 
 
 def make_app(conn, config, llm, player) -> HadesApp:
-    return HadesApp(conn, config.database_path, lambda: llm, player)
+    return HadesApp(conn, config.database_path, lambda: llm, player, config.export_directory)
 
 
 def test_generate_navigate_play_edit_save(conn, config, music_dir: Path) -> None:
@@ -115,14 +115,15 @@ def test_generate_navigate_play_edit_save(conn, config, music_dir: Path) -> None
             await pilot.press("space")
             await until(pilot, lambda: player.actions()[-1] == ("toggle_pause",))
             await until(pilot, lambda: app.player_state.paused)
-            await pilot.press("s")
-            await until(pilot, lambda: player.actions()[-1] == ("stop",))
-            assert app.playing_id is None
+            await pilot.press("s")  # no stop key: pausing is enough
+            await pilot.pause(0.1)
+            assert player.actions()[-1] == ("toggle_pause",) and app.playing_id == third.id
+            assert str(table.get_row_at(0)[6]) == "2026-05-10"  # filesystem creation date
 
             # Edits by stable track ID.
             await submit(pilot, app, f"move {third.id} to 1")
             assert [t.id for t in app.playlist.tracks[:3]] == [third.id, first.id, second.id]
-            assert "BPM drop" in str(table.get_row_at(1)[6])  # transition indicator recalculated
+            assert "BPM drop" in str(table.get_row_at(1)[7])  # transition indicator recalculated
             await submit(pilot, app, f"remove {first.id}")
             assert app.playlist.position_of(first.id) is None and table.row_count == 3
             spare = next(i for i in ids if app.playlist.position_of(i) is None)
@@ -137,7 +138,19 @@ def test_generate_navigate_play_edit_save(conn, config, music_dir: Path) -> None
             await submit(pilot, app, "save")
             assert "Saved “Warmup” (4 tracks)" in log_text(app)
             saved = [t.id for t in app.playlist.tracks]
+            m3u = config.export_directory / "Warmup.m3u"
+            assert m3u.read_text().count(".mp3\n") == 4
 
+            # Same request again: no LLM call, a different version, the saved one kept.
+            calls = len(llm.calls)
+            await submit(pilot, app, "again")
+            await until(pilot, lambda: app.playlist.id is None and len(app.playlist) == 4)
+            assert len(llm.calls) == calls
+            assert app.playlist.prompt == "4 techno tracks getting faster"
+            assert {t.id for t in app.playlist.tracks} != set(saved)
+            assert "tracks are new" in log_text(app)
+
+            await submit(pilot, app, "new")  # the new version is unsaved: confirm twice
             await submit(pilot, app, "new")
             assert len(app.playlist) == 0
             await submit(pilot, app, "playlists")
@@ -157,8 +170,11 @@ def test_unsaved_changes_need_confirmation(conn, config, music_dir: Path) -> Non
             await submit(pilot, app, f"add {ids[0]}")
             await submit(pilot, app, "new")
             assert len(app.playlist) == 1 and "unsaved changes" in log_text(app)
-            await submit(pilot, app, "new")
-            assert len(app.playlist) == 0
+            prompt = app.query_one("#prompt", Input)
+            assert prompt.value == "new", "the input stays, so Enter confirms"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert len(app.playlist) == 0 and prompt.value == ""
 
     asyncio.run(scenario())
 

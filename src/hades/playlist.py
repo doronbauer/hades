@@ -37,6 +37,7 @@ class Playlist:
     status: str = "manual"                 # complete | partial | manual
     named: bool = False                    # the user has assigned a name
     dirty: bool = False                    # unsaved changes
+    saved_name: str | None = None          # name in the database at the last save/load
 
     @classmethod
     def from_result(cls, result: BuildResult, prompt: str | None) -> Playlist:

@@ -27,11 +27,20 @@ from hades.llm import LLMClient, LLMError, refine_playlist
 from hades.player import Player, PlayerError, PlayerState, PreviewMode
 from hades.playlist import EditError, Entry, Playlist
 from hades.query import find_candidates, load_track, track_violations
-from hades.repository import RepositoryError, list_playlists, load_playlist, save_playlist
-from hades.service import generate, report_lines
+from hades.export import export_m3u
+from hades.repository import RepositoryError, list_playlists, load_playlist
+from hades.service import (
+    ExportError,
+    generate,
+    generate_again,
+    report_lines,
+    save_and_export,
+)
 
-FIXED_COLUMNS = (("#", 5), ("ID", 6), ("BPM", 5), ("Key", 4), ("Time", 7), ("Notes", 30))
-HELP_KEYS = ("↑↓ Navigate & play   Space Pause   M Preview mode   S Stop   "
+FIXED_COLUMNS = (("#", 5), ("ID", 6), ("BPM", 5), ("Key", 4), ("Time", 7), ("Added", 10),
+                 ("Notes", 26))
+COLUMNS = ("#", "ID", "Artist — Title", "BPM", "Key", "Time", "Added", "Notes")
+HELP_KEYS = ("↑↓ Navigate & play   Space Pause/resume   M Preview mode   "
              "Tab Switch focus   Enter Submit   Ctrl+Q Quit   (type `help` for commands)")
 
 
@@ -41,7 +50,6 @@ class PlaylistTable(DataTable):
     BINDINGS = [
         Binding("space", "app.toggle_pause", "Pause"),
         Binding("m", "app.toggle_mode", "Preview mode"),
-        Binding("s", "app.stop", "Stop"),
     ]
 
     class Navigated(Message):
@@ -74,10 +82,13 @@ class HadesApp(App[None]):
     """
 
     def __init__(self, conn: sqlite3.Connection, db_path: Path,
-                 llm_factory: Callable[[], LLMClient], player: Player) -> None:
+                 llm_factory: Callable[[], LLMClient], player: Player,
+                 export_dir: Path = Path("exports"), export_extension: str = ".m3u") -> None:
         super().__init__()
+        self.export_extension = export_extension
         self.conn = conn
         self.db_path = db_path
+        self.export_dir = export_dir
         self._llm_factory = llm_factory
         self._llm: LLMClient | None = None
         self.player = player
@@ -106,7 +117,7 @@ class HadesApp(App[None]):
     def on_mount(self) -> None:
         table = self.query_one(PlaylistTable)
         widths = dict(FIXED_COLUMNS)
-        for label in ("#", "ID", "Artist — Title", "BPM", "Key", "Time", "Notes"):
+        for label in COLUMNS:
             table.add_column(label, key=label, width=widths.get(label, self._title_width()))
         self.refresh_view()
         self.query_one("#prompt", Input).focus()
@@ -153,10 +164,11 @@ class HadesApp(App[None]):
             bpm = "–" if t.bpm is None else f"{t.bpm:.0f}" + ("" if t.bpm_reliable else "?")
             key = "–" if t.camelot is None else t.camelot + ("" if t.key_reliable else "?")
             time = fmt_duration(t.duration) if t.duration else "–"
+            added = t.created_date.isoformat() if t.created_date else "–"
             style = "bold green" if t.id == self.playing_id else ("red" if not t.available else "")
             table.add_row(
                 Text(f"{marker}{pos}", style=style), str(t.id), _fit(t.display, title_w, style),
-                bpm, key, time, _fit(", ".join(notes), 30, "yellow"), key=str(t.id))
+                bpm, key, time, added, _fit(", ".join(notes), 26, "yellow"), key=str(t.id))
         if pl.entries:
             row = (pl.position_of(focus_track) or 1) - 1 if focus_track is not None \
                 else min(old_row, len(pl) - 1)
@@ -231,11 +243,6 @@ class HadesApp(App[None]):
     def action_toggle_pause(self) -> None:
         self._player_call(self.player.toggle_pause)
 
-    def action_stop(self) -> None:
-        self._player_call(self.player.stop)
-        self.playing_id = None
-        self.refresh_view()
-
     def action_toggle_mode(self) -> None:
         # Affects the next selection only; the current track keeps playing.
         self.mode = "MIDDLE" if self.mode == "START" else "START"
@@ -280,7 +287,7 @@ class HadesApp(App[None]):
         except CommandError as exc:
             self.log_line(str(exc), "red")
             return
-        if command is None or command.action in ("open", "new"):
+        if command is None or command.action in ("open", "new", "again"):
             if not self._may_discard(text):
                 return
         if command is None:
@@ -289,13 +296,18 @@ class HadesApp(App[None]):
             self.run_command(command)
 
     def _may_discard(self, text: str) -> bool:
-        """Replacing a playlist with unsaved changes needs the same input twice."""
+        """Replacing a playlist with unsaved changes needs the same input twice.
+
+        The input is put back in the prompt, so confirming is a single Enter.
+        """
         if not (self.playlist.dirty and len(self.playlist)) or self._pending_discard == text:
             self._pending_discard = None
             return True
         self._pending_discard = text
-        self.log_line("The current playlist has unsaved changes. `save` it, or submit the "
-                      "same input again to discard them.", "yellow")
+        self.query_one("#prompt", Input).value = text
+        self.log_line(f"“{self.playlist.name}” has unsaved changes. Press Enter again to discard "
+                      "it and continue, or clear the prompt and type `save` to keep it.",
+                      "yellow")
         return False
 
     def run_command(self, cmd: Command) -> None:
@@ -320,8 +332,19 @@ class HadesApp(App[None]):
                     self.log_line(f"Track {track.id} is currently unavailable ({track.path}).",
                                   "yellow")
             elif cmd.action == "save":
-                save_playlist(self.conn, pl)
-                self.log_line(f"Saved “{pl.name}” ({len(pl)} tracks).", "green")
+                path = save_and_export(self.conn, pl, self.export_dir, self.export_extension)
+                self.log_line(f"Saved “{pl.name}” ({len(pl)} tracks) → {path}", "green")
+                self._warn_unavailable()
+            elif cmd.action == "export":
+                target = Path(cmd.text).expanduser() if cmd.text else self.export_dir
+                try:
+                    path = export_m3u(pl, target, self.export_extension)
+                except OSError as exc:
+                    raise ExportError(f"could not write {target}: {exc.strerror or exc}") from None
+                self.log_line(f"Exported {len(pl)} tracks → {path}", "green")
+                self._warn_unavailable()
+            elif cmd.action == "again":
+                self.start_again()
             elif cmd.action == "playlists":
                 items = list_playlists(self.conn)
                 if not items:
@@ -340,9 +363,15 @@ class HadesApp(App[None]):
                 self.start_refinement()
             elif cmd.action == "help":
                 self.log_line(HELP_TEXT)
-        except (EditError, RepositoryError) as exc:
+        except (EditError, RepositoryError, ExportError) as exc:
             self.log_line(str(exc), "red")
         self.refresh_view(focus_track=cmd.track_id if cmd.action in ("move", "add") else None)
+
+    def _warn_unavailable(self) -> None:
+        n = sum(1 for t in self.playlist.tracks if not t.available)
+        if n:
+            self.log_line(f"{n} track(s) in the file are currently unavailable on disk.",
+                          "yellow")
 
     # ------------------------------------------------------------------ background work
 
@@ -390,6 +419,48 @@ class HadesApp(App[None]):
             return
         result: BuildResult = gen.result
         self.playlist = Playlist.from_result(result, gen.request)
+        for line in report_lines(result):
+            style = "red" if line.startswith("UNMET") else (
+                "yellow" if line.startswith("Warning") else "")
+            self.log_line(line, style)
+        self.refresh_view()
+        self.query_one(PlaylistTable).move_cursor(row=0)
+
+    def start_again(self) -> None:
+        if self.playlist.spec is None:
+            self.log_line("This playlist was not generated from a request, so there is "
+                          "nothing to run again.", "yellow")
+            return
+        if self.busy:
+            self.log_line(f"Please wait: {self.busy}.", "yellow")
+            return
+        self._set_busy("building another version")
+        self._again(self.playlist)
+
+    @work(thread=True, exclusive=True, group="llm")
+    def _again(self, playlist: Playlist) -> None:
+        try:
+            conn = connect(self.db_path)
+            try:
+                result = generate_again(conn, playlist)
+            finally:
+                conn.close()
+        except Exception as exc:  # never let a worker crash the UI
+            self.call_from_thread(self._background_failed, f"could not run again: {exc!r}")
+            return
+        self.call_from_thread(self._again_done, playlist, result)
+
+    def _again_done(self, previous: Playlist, result: BuildResult) -> None:
+        self._set_busy(None)
+        if previous is not self.playlist:
+            self.log_line("Discarded: the playlist was replaced meanwhile.", "yellow")
+            return
+        before = {t.id for t in previous.tracks}
+        self.playlist = Playlist.from_result(result, previous.prompt)
+        new = sum(1 for t in result.tracks if t.id not in before)
+        self.log_line(f"Another version of the same request: {new} of {len(result.tracks)} "
+                      f"tracks are new. `again` for more; the previous one is "
+                      f"{'still saved as “' + previous.name + '”' if previous.id else 'discarded'}.")
         for line in report_lines(result):
             style = "red" if line.startswith("UNMET") else (
                 "yellow" if line.startswith("Warning") else "")

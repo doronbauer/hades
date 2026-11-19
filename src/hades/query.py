@@ -62,6 +62,15 @@ class Track:
     genre: str | None
     file_created: str | None
     file_exists: bool = True
+    album: str | None = None
+
+    @property
+    def artist_names(self) -> frozenset[str]:
+        return artist_names(self.artist)
+
+    @property
+    def album_key(self) -> str | None:
+        return normalize_text(self.album) or None if self.album else None
 
     @property
     def available(self) -> bool:
@@ -140,6 +149,19 @@ def genre_matches(track_genre: str | None, requested: list[str]) -> bool:
     return False
 
 
+_ARTIST_SEPARATORS = re.compile(
+    r"\s*(?:,|;|/|&|\+|\bx\b|\bvs\.?|\bfeat\.?|\bft\.?|\bfeaturing\b|\bwith\b)\s*",
+    re.IGNORECASE)
+
+
+def artist_names(artist: str | None) -> frozenset[str]:
+    """Individual normalized names in a credit: "Clark, Marcel Dettmann" -> {clark, marcel dettmann}."""
+    if not artist:
+        return frozenset()
+    names = {normalize_text(p) for p in _ARTIST_SEPARATORS.split(artist)}
+    return frozenset(n for n in names if n)
+
+
 def artist_matches(track_artist: str | None, names: list[str]) -> bool:
     if not track_artist:
         return False
@@ -187,7 +209,7 @@ _SELECT = """
 SELECT t.id, t.path, t.filename, t.directory, t.status, t.duration,
        t.effective_bpm, t.effective_bpm_source, t.bpm_flag,
        t.effective_key, t.effective_key_camelot, t.effective_key_source, t.key_flag,
-       t.effective_genre, t.file_created, g.artist, g.title
+       t.effective_genre, t.file_created, g.artist, g.title, g.album
 FROM tracks t
 LEFT JOIN track_tags g ON g.track_id = t.id
 """
@@ -203,6 +225,7 @@ def _track(row: sqlite3.Row, check_file: bool = True) -> Track:
         key_source=row["effective_key_source"], key_flag=row["key_flag"],
         genre=row["effective_genre"], file_created=row["file_created"],
         file_exists=os.path.isfile(row["path"]) if check_file else True,
+        album=row["album"],
     )
 
 

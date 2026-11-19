@@ -11,6 +11,8 @@ from typing import Any
 CONFIG_ENV_VAR = "HADES_CONFIG"
 DEFAULT_CONFIG_PATH = Path("config.toml")
 DEFAULT_DATABASE_PATH = "./data/library.sqlite3"
+DEFAULT_EXPORT_DIRECTORY = "./exports"
+PLAYLIST_FORMATS = ("m3u", "m3u8")
 
 BPM_METHODS = ("multifeature", "degara")
 LLM_PROVIDERS = ("anthropic", "openai")
@@ -59,6 +61,12 @@ class Config:
     music_directories: tuple[Path, ...]
     database_path: Path
     analysis: AnalysisSettings = field(default_factory=AnalysisSettings)
+    export_directory: Path = Path(DEFAULT_EXPORT_DIRECTORY)  # where saved playlists are written
+    playlist_format: str = "m3u"                             # m3u (Traktor) | m3u8
+
+    @property
+    def export_extension(self) -> str:
+        return "." + self.playlist_format
     llm: LLMSettings = field(default_factory=LLMSettings)
     player: PlayerSettings = field(default_factory=PlayerSettings)
 
@@ -95,8 +103,17 @@ def load_config(path: Path) -> Config:
     if not isinstance(database, str) or not database.strip():
         raise ConfigError("database_path must be a non-empty string")
 
+    export_dir = data.get("export_directory", DEFAULT_EXPORT_DIRECTORY)
+    if not isinstance(export_dir, str) or not export_dir.strip():
+        raise ConfigError("export_directory must be a non-empty string")
+    playlist_format = data.get("playlist_format", "m3u")
+    if playlist_format not in PLAYLIST_FORMATS:
+        raise ConfigError(f"playlist_format must be one of {', '.join(PLAYLIST_FORMATS)}")
+
     return Config(
         path=path,
+        export_directory=_resolve_path(export_dir, base),
+        playlist_format=playlist_format,
         music_directories=tuple(_resolve_path(d, base) for d in dirs),
         database_path=_resolve_path(database, base),
         analysis=_load_analysis(data.get("analysis", {})),
