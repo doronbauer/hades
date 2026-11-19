@@ -7,6 +7,10 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
     "tinytag==2.3.2",
     "essentia==2.1b6.dev1389",
+    "textual>=8.2.8",
+    "pydantic>=2.14.3",
+    "anthropic>=2.10.0",
+    "openai>=3.55.1",
 ]
 
 [project.scripts]

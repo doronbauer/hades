@@ -163,7 +163,31 @@ CREATE TABLE scan_runs (
 );
 """
 
-MIGRATIONS: list[str] = [SCHEMA_V1]
+SCHEMA_V2 = """
+-- Saved playlists. Track metadata is never copied here: rows reference tracks(id).
+CREATE TABLE playlists (
+    id                    INTEGER PRIMARY KEY,
+    name                  TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL,
+    original_prompt       TEXT,              -- natural-language request, if generated
+    generation_parameters TEXT,              -- validated query specification (JSON)
+    generation_status     TEXT NOT NULL DEFAULT 'manual'
+                          CHECK (generation_status IN ('complete', 'partial', 'manual'))
+);
+
+CREATE TABLE playlist_tracks (
+    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    track_id    INTEGER NOT NULL REFERENCES tracks(id),
+    position    INTEGER NOT NULL CHECK (position >= 1),   -- 1-based, explicit order
+    added_at    TEXT NOT NULL,
+    PRIMARY KEY (playlist_id, track_id),
+    UNIQUE (playlist_id, position)
+);
+CREATE INDEX idx_playlist_tracks_track ON playlist_tracks(track_id);
+"""
+
+MIGRATIONS: list[str] = [SCHEMA_V1, SCHEMA_V2]
 
 
 def now_iso() -> str:

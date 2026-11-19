@@ -13,6 +13,13 @@ DEFAULT_CONFIG_PATH = Path("config.toml")
 DEFAULT_DATABASE_PATH = "./data/library.sqlite3"
 
 BPM_METHODS = ("multifeature", "degara")
+LLM_PROVIDERS = ("anthropic", "openai")
+# provider -> (default model, default API key environment variable)
+LLM_DEFAULTS = {
+    "anthropic": ("claude-opus-5-5", "ANTHROPIC_API_KEY"),
+    "openai": ("gpt-6.1-terra", "OPENAI_API_KEY"),
+}
+LLM_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
 class ConfigError(Exception):
@@ -28,11 +35,32 @@ class AnalysisSettings:
 
 
 @dataclass(frozen=True)
+class LLMSettings:
+    provider: str = "anthropic"
+    model: str = "claude-opus-5-5"
+    api_key_env: str = "ANTHROPIC_API_KEY"  # unset: the SDK's own credential lookup applies
+    effort: str = "low"                      # request interpretation is a small extraction task
+    timeout_seconds: float = 60.0
+    api_key: str | None = field(default=None, repr=False)  # from config.toml; wins over the env var
+
+    @property
+    def resolved_api_key(self) -> str | None:
+        return self.api_key or os.environ.get(self.api_key_env) or None
+
+
+@dataclass(frozen=True)
+class PlayerSettings:
+    mpv_path: str = "mpv"
+
+
+@dataclass(frozen=True)
 class Config:
     path: Path
     music_directories: tuple[Path, ...]
     database_path: Path
     analysis: AnalysisSettings = field(default_factory=AnalysisSettings)
+    llm: LLMSettings = field(default_factory=LLMSettings)
+    player: PlayerSettings = field(default_factory=PlayerSettings)
 
 
 def resolve_config_path(explicit: str | None) -> Path:
@@ -72,6 +100,8 @@ def load_config(path: Path) -> Config:
         music_directories=tuple(_resolve_path(d, base) for d in dirs),
         database_path=_resolve_path(database, base),
         analysis=_load_analysis(data.get("analysis", {})),
+        llm=_load_llm(data.get("llm", {})),
+        player=_load_player(data.get("player", {})),
     )
 
 
@@ -107,3 +137,42 @@ def _load_analysis(section: Any) -> AnalysisSettings:
         key_profile=key_profile,
         max_duration_seconds=float(max_duration),
     )
+
+
+def _load_llm(section: Any) -> LLMSettings:
+    if not isinstance(section, dict):
+        raise ConfigError("[llm] must be a table")
+    defaults = LLMSettings()
+    provider = section.get("provider", defaults.provider)
+    if provider not in LLM_PROVIDERS:
+        raise ConfigError(f"llm.provider must be one of {', '.join(LLM_PROVIDERS)}")
+    default_model, default_env = LLM_DEFAULTS[provider]
+    model = section.get("model", default_model)
+    api_key_env = section.get("api_key_env", default_env)
+    api_key = section.get("api_key")
+    effort = section.get("effort", defaults.effort)
+    timeout = section.get("timeout_seconds", defaults.timeout_seconds)
+
+    if not isinstance(model, str) or not model.strip():
+        raise ConfigError("llm.model must be a non-empty string")
+    if not isinstance(api_key_env, str) or not api_key_env.strip():
+        raise ConfigError("llm.api_key_env must be the name of an environment variable")
+    if effort not in LLM_EFFORTS:
+        raise ConfigError(f"llm.effort must be one of {', '.join(LLM_EFFORTS)}")
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise ConfigError("llm.timeout_seconds must be a positive number")
+    if api_key is not None and not isinstance(api_key, str):
+        raise ConfigError("llm.api_key must be a string")
+
+    return LLMSettings(provider=provider, model=model, api_key_env=api_key_env,
+                       effort=effort, timeout_seconds=float(timeout),
+                       api_key=api_key.strip() if api_key and api_key.strip() else None)
+
+
+def _load_player(section: Any) -> PlayerSettings:
+    if not isinstance(section, dict):
+        raise ConfigError("[player] must be a table")
+    mpv_path = section.get("mpv_path", PlayerSettings().mpv_path)
+    if not isinstance(mpv_path, str) or not mpv_path.strip():
+        raise ConfigError("player.mpv_path must be a non-empty string")
+    return PlayerSettings(mpv_path=mpv_path)

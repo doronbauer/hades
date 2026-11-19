@@ -108,3 +108,74 @@ class FakeAnalyzer:
             key_strength=0.8, loudness_lufs=-9.0, loudness_range_lu=4.0,
             dynamic_complexity=2.0, analyzed_seconds=8.0,
         )
+
+
+# --------------------------------------------------------------------------- playlist fixtures
+
+
+def _key_name(camelot: str | None) -> str | None:
+    from hades.keys import parse_key
+
+    key = parse_key(camelot) if camelot else None
+    return key.name if key else None
+
+
+def insert_track(conn, music_dir: Path, *, artist: str | None = "Artist", title: str | None = None,
+                 bpm: float | None = 128.0, camelot: str | None = "8A", genre: str | None = "Techno",
+                 duration: float | None = 300.0, created: str | None = "2026-05-10T12:00:00+00:00",
+                 status: str = "available", bpm_flag: str | None = None,
+                 bpm_source: str | None = "tag", key_flag: str | None = None,
+                 key_source: str | None = "tag", subdir: str = "", create_file: bool = True) -> int:
+    """Insert a fully reconciled track row (plus tags) without scanning audio."""
+    n = conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] + 1
+    directory = music_dir / subdir if subdir else music_dir
+    path = directory / f"track{n}.mp3"
+    if create_file:
+        directory.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x00")
+    cur = conn.execute(
+        """INSERT INTO tracks (path, filename, directory, root, format, file_size, file_mtime_ns,
+                               file_modified, file_created, content_signature, duration,
+                               first_indexed, last_seen, status, effective_bpm,
+                               effective_bpm_source, bpm_flag, effective_key, effective_key_camelot,
+                               effective_key_source, key_flag, effective_genre,
+                               effective_genre_source)
+           VALUES (?, ?, ?, ?, 'MP3', 1, 1, ?, ?, '1:1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (str(path), path.name, str(directory), str(music_dir), created or "2026-01-01T00:00:00+00:00",
+         created, duration, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", status,
+         bpm, bpm_source if bpm is not None else None, bpm_flag, _key_name(camelot), camelot,
+         key_source if camelot else None, key_flag, genre, "tag" if genre else None))
+    track_id = int(cur.lastrowid)
+    conn.execute(
+        "INSERT INTO track_tags (track_id, title, artist, genre, raw_json, extractor, extracted_at) "
+        "VALUES (?, ?, ?, ?, '{}', 'test', '2026-01-01T00:00:00+00:00')",
+        (track_id, title or f"Track {track_id}", artist, genre))
+    conn.commit()
+    return track_id
+
+
+class FakeLLM:
+    """Returns queued JSON answers and records what it was asked."""
+
+    def __init__(self, *answers: dict) -> None:
+        self.answers = list(answers)
+        self.calls: list[tuple[str, str]] = []
+
+    def complete_json(self, system: str, user: str, schema: dict) -> dict:
+        self.calls.append((system, user))
+        if not self.answers:
+            raise AssertionError("FakeLLM: no answer queued")
+        answer = self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+def spec_answer(**spec) -> dict:
+    """An interpretation answer in the LLM's wire format (all fields present)."""
+    full = {"genre": [], "created_after": None, "created_before": None, "bpm": None,
+            "duration_minutes": None, "duration_mode": None, "duration_tolerance_minutes": None,
+            "track_count": None, "folder": None, "artists": [], "exclude_artists": [],
+            "ordering": {"bpm_progression": "none", "harmonic_compatibility": False}}
+    full.update(spec)
+    return {"error": None, "spec": full}

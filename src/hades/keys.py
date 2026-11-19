@@ -99,3 +99,31 @@ def from_essentia(tonic: str, scale: str) -> Key | None:
     if scale not in ("major", "minor"):
         return None
     return parse_key(f"{tonic} {scale}")
+
+
+def camelot_parts(camelot: str) -> tuple[int, str] | None:
+    """Split "8A" into (8, "A"); None if not a valid Camelot code."""
+    m = re.fullmatch(r"(1[0-2]|[1-9])([AB])", camelot.strip().upper())
+    return (int(m[1]), m[2]) if m else None
+
+
+def harmonic_compatibility(a: str, b: str) -> float:
+    """Score a transition between two Camelot keys from 0.0 (clash) to 1.0 (same key).
+
+    Same key 1.0; one step around the wheel 0.9; relative major/minor 0.85;
+    one step plus a mode change 0.5; two steps 0.25; anything else 0.0.
+    Callers must not pass missing or unreliable keys here; they decide their own score.
+    """
+    pa, pb = camelot_parts(a), camelot_parts(b)
+    if pa is None or pb is None:
+        raise ValueError(f"not a Camelot key: {a if pa is None else b!r}")
+    step = (pb[0] - pa[0]) % 12
+    distance = min(step, 12 - step)
+    same_mode = pa[1] == pb[1]
+    if distance == 0:
+        return 1.0 if same_mode else 0.85
+    if distance == 1:
+        return 0.9 if same_mode else 0.5
+    if distance == 2 and same_mode:
+        return 0.25
+    return 0.0

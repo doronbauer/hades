@@ -6,11 +6,15 @@ import argparse
 import sqlite3
 import sys
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from hades import __version__
 from hades.config import CONFIG_ENV_VAR, Config, ConfigError, load_config, resolve_config_path
 from hades.db import connect
 from hades.progress import Progress
+
+if TYPE_CHECKING:
+    from hades.playlist import Playlist
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,6 +71,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-missing", action="store_true", help="include missing tracks")
     p.add_argument("--list-fields", action="store_true", help="list available fields and exit")
     p.set_defaults(handler=cmd_export)
+
+    p = sub.add_parser("ui", help="interactive playlist creator and player (terminal UI)")
+    p.set_defaults(handler=cmd_ui)
+
+    p = sub.add_parser("generate", help="create a playlist from a natural-language request")
+    p.add_argument("request", help='e.g. "a one-hour techno set with rising tempo"')
+    p.add_argument("--refine", action="store_true",
+                   help="let the LLM propose a better selection/order (re-validated)")
+    p.add_argument("--save", metavar="NAME", help="save the playlist under this name")
+    p.set_defaults(handler=cmd_generate)
+
+    p = sub.add_parser("playlists", help="list saved playlists, or show one")
+    p.add_argument("name", nargs="?", help="playlist to show")
+    p.set_defaults(handler=cmd_playlists)
 
     return parser
 
@@ -213,3 +231,87 @@ def cmd_export(args: argparse.Namespace, config: Config, conn: sqlite3.Connectio
         print(f"error: {exc}", file=sys.stderr)
         return 2
     return 0
+
+
+def cmd_ui(args: argparse.Namespace, config: Config, conn: sqlite3.Connection) -> int:
+    from hades.llm import make_client
+    from hades.player import make_player
+    from hades.tui import HadesApp
+
+    app = HadesApp(conn, config.database_path, lambda: make_client(config.llm),
+                   make_player(config.player.mpv_path))
+    app.run()
+    return 0
+
+
+def cmd_generate(args: argparse.Namespace, config: Config, conn: sqlite3.Connection) -> int:
+    from hades.llm import LLMError, make_client, refine_playlist
+    from hades.playlist import Playlist
+    from hades.repository import RepositoryError, save_playlist
+    from hades.service import generate, report_lines
+
+    try:
+        client = make_client(config.llm)
+        gen = generate(conn, args.request, client)
+        if gen.error:
+            print(f"error: could not create a playlist: {gen.error}", file=sys.stderr)
+            return 1
+        assert gen.result is not None and gen.pool is not None
+        result = gen.result
+        if args.refine:
+            outcome = refine_playlist(result, gen.pool.tracks, client, args.request)
+            print(f"Refinement {outcome.message}", file=sys.stderr)
+            result = outcome.result
+    except LLMError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    playlist = Playlist.from_result(result, args.request)
+    _print_playlist(playlist)
+    print()
+    print("\n".join(report_lines(result)))
+    if args.save:
+        playlist.rename(args.save)
+        try:
+            save_playlist(conn, playlist)
+        except RepositoryError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Saved as {playlist.name!r}")
+    return 0 if not result.unsatisfied else 3
+
+
+def cmd_playlists(args: argparse.Namespace, config: Config, conn: sqlite3.Connection) -> int:
+    from hades.repository import RepositoryError, list_playlists, load_playlist
+
+    if args.name:
+        try:
+            playlist = load_playlist(conn, args.name)
+        except RepositoryError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(playlist.name)
+        _print_playlist(playlist)
+        for v in playlist.violations():
+            print(f"  WARNING  {v}")
+        return 0
+    items = list_playlists(conn)
+    if not items:
+        print("No saved playlists.")
+    for p in items:
+        print(f"{p.name}\t{p.track_count} tracks\t{p.generation_status}\t{p.updated_at}")
+    return 0
+
+
+def _print_playlist(playlist: Playlist) -> None:
+    from hades.builder import fmt_duration
+
+    issues = [()] + [t.issues for t in playlist.transitions()]
+    for pos, (t, tr) in enumerate(zip(playlist.tracks, issues), start=1):
+        bpm = f"{t.bpm:.0f}" if t.bpm is not None else "-"
+        key = t.camelot or "-"
+        time = fmt_duration(t.duration) if t.duration else "-"
+        note = f"  [{', '.join(tr)}]" if tr else ""
+        print(f"{pos:>3}  {t.id:>6}  {t.display[:50]:<50}  {bpm:>4}  {key:>3}  {time:>6}{note}")
+    s = playlist.stats
+    print(f"{s.count} tracks | {fmt_duration(s.total_seconds)} total | {s.bpm_range}")

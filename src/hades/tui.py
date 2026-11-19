@@ -1,0 +1,457 @@
+"""Interactive terminal UI: prompt, playlist table and player status.
+
+Slow work never runs on the UI event loop: LLM requests and candidate queries
+run in worker threads (with their own database connection), and every player
+call goes through a single background thread so commands stay in order.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+from rich.text import Text
+from textual import work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.message import Message
+from textual.widgets import DataTable, Input, RichLog, Static
+
+from hades.builder import BuildResult, apply_defaults, fmt_duration
+from hades.commands import HELP_TEXT, Command, CommandError, parse_command
+from hades.db import connect, now_iso
+from hades.llm import LLMClient, LLMError, refine_playlist
+from hades.player import Player, PlayerError, PlayerState, PreviewMode
+from hades.playlist import EditError, Entry, Playlist
+from hades.query import find_candidates, load_track, track_violations
+from hades.repository import RepositoryError, list_playlists, load_playlist, save_playlist
+from hades.service import generate, report_lines
+
+FIXED_COLUMNS = (("#", 5), ("ID", 6), ("BPM", 5), ("Key", 4), ("Time", 7), ("Notes", 30))
+HELP_KEYS = ("↑↓ Navigate & play   Space Pause   M Preview mode   S Stop   "
+             "Tab Switch focus   Enter Submit   Ctrl+Q Quit   (type `help` for commands)")
+
+
+class PlaylistTable(DataTable):
+    """DataTable that reports cursor moves made by the user (not by refreshes)."""
+
+    BINDINGS = [
+        Binding("space", "app.toggle_pause", "Pause"),
+        Binding("m", "app.toggle_mode", "Preview mode"),
+        Binding("s", "app.stop", "Stop"),
+    ]
+
+    class Navigated(Message):
+        def __init__(self, row: int) -> None:
+            super().__init__()
+            self.row = row
+
+    def _moved(self, action: Callable[[], None]) -> None:
+        before = self.cursor_row
+        action()
+        if self.row_count and self.cursor_row != before:
+            self.post_message(self.Navigated(self.cursor_row))
+
+    def action_cursor_up(self) -> None:
+        self._moved(super().action_cursor_up)
+
+    def action_cursor_down(self) -> None:
+        self._moved(super().action_cursor_down)
+
+
+class HadesApp(App[None]):
+    TITLE = "Hades"
+    CSS = """
+    #title { height: 1; padding: 0 1; background: $primary; color: $text; text-style: bold; }
+    #playlist { height: 1fr; }
+    #stats { height: auto; max-height: 3; padding: 0 1; }
+    #player { height: 2; padding: 0 1; background: $boost; }
+    #log { height: 8; padding: 0 1; border-top: solid $primary-darken-2; }
+    #help { height: 1; padding: 0 1; color: $text-muted; }
+    """
+
+    def __init__(self, conn: sqlite3.Connection, db_path: Path,
+                 llm_factory: Callable[[], LLMClient], player: Player) -> None:
+        super().__init__()
+        self.conn = conn
+        self.db_path = db_path
+        self._llm_factory = llm_factory
+        self._llm: LLMClient | None = None
+        self.player = player
+        self.playlist = Playlist()
+        self.mode: PreviewMode = "START"
+        self.playing_id: int | None = None
+        self.player_state = PlayerState()
+        self.busy: str | None = None             # description of running background work
+        self._seen_playing = False
+        self._pending_discard: str | None = None
+        self._last_playback_error: str | None = None
+        self._player_thread = ThreadPoolExecutor(max_workers=1, thread_name_prefix="player")
+        self._poll: Future[PlayerState] | None = None
+
+    # ------------------------------------------------------------------ layout
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="title")
+        yield PlaylistTable(id="playlist", cursor_type="row", zebra_stripes=True)
+        yield Static(id="stats")
+        yield Static(id="player")
+        yield RichLog(id="log", wrap=True, markup=False)
+        yield Static(HELP_KEYS, id="help")
+        yield Input(placeholder="Describe a playlist, or type a command (help)", id="prompt")
+
+    def on_mount(self) -> None:
+        table = self.query_one(PlaylistTable)
+        widths = dict(FIXED_COLUMNS)
+        for label in ("#", "ID", "Artist — Title", "BPM", "Key", "Time", "Notes"):
+            table.add_column(label, key=label, width=widths.get(label, self._title_width()))
+        self.refresh_view()
+        self.query_one("#prompt", Input).focus()
+        self.set_interval(0.5, self._poll_player)
+
+    def on_unmount(self) -> None:
+        self._player_thread.submit(self.player.close)
+        self._player_thread.shutdown(wait=True)
+
+    # ------------------------------------------------------------------ rendering
+
+    def _title_width(self) -> int:
+        # Each column has 1 cell of padding on both sides.
+        used = sum(w + 2 for _, w in FIXED_COLUMNS) + 2 + 2
+        return max(20, self.size.width - used)
+
+    def on_resize(self) -> None:
+        table = self.query_one(PlaylistTable)
+        if "Artist — Title" in table.columns:
+            table.columns["Artist — Title"].width = self._title_width()  # type: ignore[index]
+            self.refresh_view()
+
+    def log_line(self, text: str, style: str = "") -> None:
+        self.query_one("#log", RichLog).write(Text(text, style=style))
+
+    def refresh_view(self, focus_track: int | None = None) -> None:
+        pl = self.playlist
+        self.query_one("#title", Static).update(
+            f"HADES  |  {pl.name}{' *' if pl.dirty else ''}")
+
+        table = self.query_one(PlaylistTable)
+        old_row = table.cursor_row
+        table.clear()
+        title_w = self._title_width()
+        issues_into = [()] + [t.issues for t in pl.transitions()]
+        for pos, (entry, issues) in enumerate(zip(pl.entries, issues_into), start=1):
+            t = entry.track
+            notes = list(issues)
+            if pl.spec is not None:
+                notes += track_violations(t, pl.spec)
+            elif not t.available:
+                notes.append("file unavailable")
+            marker = "▶" if t.id == self.playing_id else " "
+            bpm = "–" if t.bpm is None else f"{t.bpm:.0f}" + ("" if t.bpm_reliable else "?")
+            key = "–" if t.camelot is None else t.camelot + ("" if t.key_reliable else "?")
+            time = fmt_duration(t.duration) if t.duration else "–"
+            style = "bold green" if t.id == self.playing_id else ("red" if not t.available else "")
+            table.add_row(
+                Text(f"{marker}{pos}", style=style), str(t.id), _fit(t.display, title_w, style),
+                bpm, key, time, _fit(", ".join(notes), 30, "yellow"), key=str(t.id))
+        if pl.entries:
+            row = (pl.position_of(focus_track) or 1) - 1 if focus_track is not None \
+                else min(old_row, len(pl) - 1)
+            table.move_cursor(row=max(row, 0))
+
+        s = pl.stats
+        stats = f"{s.count} tracks | {fmt_duration(s.total_seconds)} total | {s.bpm_range}"
+        if s.unknown_duration:
+            stats += f" | {s.unknown_duration} with unknown length"
+        if pl.prompt:
+            stats += f" | “{pl.prompt}”"
+        text = Text(stats)
+        violations = [v for v in pl.violations() if not v.startswith("#")]
+        if violations:
+            text.append("\n⚠ " + "; ".join(violations), style="bold yellow")
+        self.query_one("#stats", Static).update(text)
+        self._render_player()
+
+    def _render_player(self) -> None:
+        st = self.player_state
+        track = None
+        if self.playing_id is not None:
+            pos = self.playlist.position_of(self.playing_id)
+            track = self.playlist.entries[pos - 1].track if pos else load_track(
+                self.conn, self.playing_id)
+        now = f"Now playing: {track.display}" if track else "Now playing: —"
+        if st.playing:
+            state = "Paused" if st.paused else "Playing"
+            clock = f"{_clock(st.position)} / {_clock(st.duration)}"
+        else:
+            state, clock = "Stopped", "--:-- / --:--"
+        busy = f"    ⏳ {self.busy}…" if self.busy else ""
+        self.query_one("#player", Static).update(
+            f"{now}\n{clock}    Preview: {self.mode}    {state}{busy}")
+
+    # ------------------------------------------------------------------ playback
+
+    def _player_call(self, fn: Callable[..., Any], *args: Any) -> None:
+        def run() -> None:
+            try:
+                fn(*args)
+            except PlayerError as exc:
+                self.call_from_thread(self._playback_failed, str(exc))
+        self._player_thread.submit(run)
+
+    def _playback_failed(self, message: str) -> None:
+        if message != self._last_playback_error:  # don't repeat it on every keypress
+            self.log_line(f"Playback: {message}", "red")
+        self._last_playback_error = message
+        self.playing_id = None
+        self.refresh_view()
+
+    def play_row(self, row: int) -> None:
+        if not 0 <= row < len(self.playlist):
+            return
+        track = self.playlist.entries[row].track
+        self.playing_id = track.id
+        self._seen_playing = False
+        if not track.available:
+            self._player_call(self.player.stop)
+            self._playback_failed(f"track {track.id} is unavailable ({track.path})")
+            return
+        self._player_call(self.player.play, track.path, self.mode)
+        self.refresh_view()
+
+    def on_playlist_table_navigated(self, event: PlaylistTable.Navigated) -> None:
+        self.play_row(event.row)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.play_row(event.cursor_row)
+
+    def action_toggle_pause(self) -> None:
+        self._player_call(self.player.toggle_pause)
+
+    def action_stop(self) -> None:
+        self._player_call(self.player.stop)
+        self.playing_id = None
+        self.refresh_view()
+
+    def action_toggle_mode(self) -> None:
+        # Affects the next selection only; the current track keeps playing.
+        self.mode = "MIDDLE" if self.mode == "START" else "START"
+        self._render_player()
+
+    def _poll_player(self) -> None:
+        if self._poll is not None and not self._poll.done():
+            return
+        self._poll = self._player_thread.submit(self.player.state)
+        self._poll.add_done_callback(
+            lambda f: self.call_from_thread(self._update_player, f)
+            if f.exception() is None else None)
+
+    def _update_player(self, future: Future[PlayerState]) -> None:
+        st = future.result()
+        self.player_state = st
+        if st.error:
+            self.log_line(f"Playback: {st.error}", "red")
+            self._player_thread.submit(self.player.stop)
+            self.playing_id = None
+            self.refresh_view()
+            return
+        if st.playing:
+            self._seen_playing = True
+            self._last_playback_error = None
+        elif self.playing_id is not None and self._seen_playing:
+            self.playing_id = None  # the track ended; playback stops (no auto-advance)
+            self.refresh_view()
+            return
+        self._render_player()
+
+    # ------------------------------------------------------------------ prompt
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        event.input.clear()
+        if not text:
+            return
+        self.log_line(f"> {text}", "bold")
+        try:
+            command = parse_command(text)
+        except CommandError as exc:
+            self.log_line(str(exc), "red")
+            return
+        if command is None or command.action in ("open", "new"):
+            if not self._may_discard(text):
+                return
+        if command is None:
+            self.start_generation(text)
+        else:
+            self.run_command(command)
+
+    def _may_discard(self, text: str) -> bool:
+        """Replacing a playlist with unsaved changes needs the same input twice."""
+        if not (self.playlist.dirty and len(self.playlist)) or self._pending_discard == text:
+            self._pending_discard = None
+            return True
+        self._pending_discard = text
+        self.log_line("The current playlist has unsaved changes. `save` it, or submit the "
+                      "same input again to discard them.", "yellow")
+        return False
+
+    def run_command(self, cmd: Command) -> None:
+        pl = self.playlist
+        try:
+            if cmd.action in ("name", "rename"):
+                pl.rename(cmd.text or "")
+                self.log_line(f"Playlist is now called “{pl.name}” (unsaved until `save`).")
+            elif cmd.action == "move":
+                pl.move(cmd.track_id, cmd.position)  # type: ignore[arg-type]
+                self.log_line(f"Moved {cmd.track_id} to position {cmd.position}.")
+            elif cmd.action == "remove":
+                track = pl.remove(cmd.track_id)  # type: ignore[arg-type]
+                self.log_line(f"Removed {track.id}: {track.display}.")
+            elif cmd.action == "add":
+                track = load_track(self.conn, cmd.track_id)  # type: ignore[arg-type]
+                if track is None:
+                    raise EditError(f"no track with ID {cmd.track_id} in the library")
+                pos = pl.add(track, cmd.position)
+                self.log_line(f"Added {track.id} at position {pos}: {track.display}.")
+                if not track.available:
+                    self.log_line(f"Track {track.id} is currently unavailable ({track.path}).",
+                                  "yellow")
+            elif cmd.action == "save":
+                save_playlist(self.conn, pl)
+                self.log_line(f"Saved “{pl.name}” ({len(pl)} tracks).", "green")
+            elif cmd.action == "playlists":
+                items = list_playlists(self.conn)
+                if not items:
+                    self.log_line("No saved playlists yet.")
+                for p in items:
+                    self.log_line(f"  {p.name}  ({p.track_count} tracks, {p.generation_status}, "
+                                  f"updated {p.updated_at})")
+            elif cmd.action == "open":
+                self.playlist = load_playlist(self.conn, cmd.text or "")
+                self.log_line(f"Opened “{self.playlist.name}” ({len(self.playlist)} tracks).")
+                for v in self.playlist.violations():
+                    self.log_line(f"Warning: {v}", "yellow")
+            elif cmd.action == "new":
+                self.playlist = Playlist()
+            elif cmd.action == "refine":
+                self.start_refinement()
+            elif cmd.action == "help":
+                self.log_line(HELP_TEXT)
+        except (EditError, RepositoryError) as exc:
+            self.log_line(str(exc), "red")
+        self.refresh_view(focus_track=cmd.track_id if cmd.action in ("move", "add") else None)
+
+    # ------------------------------------------------------------------ background work
+
+    def _client(self) -> LLMClient:
+        if self._llm is None:
+            self._llm = self._llm_factory()
+        return self._llm
+
+    def _set_busy(self, what: str | None) -> None:
+        self.busy = what
+        self._render_player()
+
+    def start_generation(self, request: str) -> None:
+        if self.busy:
+            self.log_line(f"Please wait: {self.busy}.", "yellow")
+            return
+        self._set_busy("interpreting request")
+        self._generate(request)
+
+    @work(thread=True, exclusive=True, group="llm")
+    def _generate(self, request: str) -> None:
+        try:
+            client = self._client()
+            conn = connect(self.db_path)
+            try:
+                gen = generate(conn, request, client)
+            finally:
+                conn.close()
+        except LLMError as exc:
+            self.call_from_thread(self._background_failed, str(exc))
+            return
+        except Exception as exc:  # never let a worker crash the UI
+            self.call_from_thread(self._background_failed, f"generation failed: {exc!r}")
+            return
+        self.call_from_thread(self._generation_done, gen)
+
+    def _background_failed(self, message: str) -> None:
+        self._set_busy(None)
+        self.log_line(message, "red")
+
+    def _generation_done(self, gen: Any) -> None:
+        self._set_busy(None)
+        if gen.error:
+            self.log_line(f"Could not create a playlist: {gen.error}", "red")
+            return
+        result: BuildResult = gen.result
+        self.playlist = Playlist.from_result(result, gen.request)
+        for line in report_lines(result):
+            style = "red" if line.startswith("UNMET") else (
+                "yellow" if line.startswith("Warning") else "")
+            self.log_line(line, style)
+        self.refresh_view()
+        self.query_one(PlaylistTable).move_cursor(row=0)
+
+    def start_refinement(self) -> None:
+        if self.playlist.spec is None or not len(self.playlist):
+            self.log_line("Only generated playlists can be refined.", "yellow")
+            return
+        if self.busy:
+            self.log_line(f"Please wait: {self.busy}.", "yellow")
+            return
+        self._set_busy("refining with the LLM")
+        self._refine(self.playlist)
+
+    @work(thread=True, exclusive=True, group="llm")
+    def _refine(self, playlist: Playlist) -> None:
+        try:
+            client = self._client()
+            conn = connect(self.db_path)
+            try:
+                spec = playlist.spec
+                assert spec is not None
+                pool = find_candidates(conn, spec)
+            finally:
+                conn.close()
+            effective, defaults = apply_defaults(spec)
+            current = BuildResult(spec=spec, effective_spec=effective, tracks=playlist.tracks,
+                                  candidate_count=len(pool.tracks), defaults=defaults)
+            outcome = refine_playlist(current, pool.tracks, client, playlist.prompt or "")
+        except LLMError as exc:
+            self.call_from_thread(self._background_failed, str(exc))
+            return
+        except Exception as exc:
+            self.call_from_thread(self._background_failed, f"refinement failed: {exc!r}")
+            return
+        self.call_from_thread(self._refinement_done, playlist, outcome)
+
+    def _refinement_done(self, playlist: Playlist, outcome: Any) -> None:
+        self._set_busy(None)
+        if playlist is not self.playlist:
+            self.log_line("Refinement discarded: the playlist was replaced meanwhile.", "yellow")
+            return
+        self.log_line(f"Refinement {outcome.message}", "green" if outcome.accepted else "yellow")
+        if outcome.accepted:
+            added = {e.track.id: e.added_at for e in playlist.entries}
+            now = now_iso()
+            playlist.entries = [Entry(t, added.get(t.id, now)) for t in outcome.result.tracks]
+            playlist.dirty = True
+            self.refresh_view()
+
+
+def _clock(seconds: float | None) -> str:
+    if seconds is None:
+        return "--:--"
+    m, s = divmod(int(seconds), 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def _fit(text: str, width: int, style: str = "") -> Text:
+    out = Text(text, style=style, no_wrap=True, overflow="ellipsis")
+    out.truncate(width, overflow="ellipsis")
+    return out

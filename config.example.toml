@@ -18,3 +18,20 @@ sample_rate = 44100            # all audio is resampled to this rate before anal
 bpm_method = "multifeature"    # Essentia RhythmExtractor2013: "multifeature" or "degara"
 key_profile = "edma"           # Essentia KeyExtractor profile; "edma" is tuned for electronic music
 max_duration_seconds = 1800    # longer files (e.g. DJ mixes) are skipped to bound memory use
+
+# Optional. Natural-language playlist requests (`hades ui`, `hades generate`).
+# provider: "anthropic" (default model claude-opus-5-5, key from $ANTHROPIC_API_KEY)
+#        or "openai"    (default model gpt-6.1-terra,   key from $OPENAI_API_KEY)
+# api_key, if set, takes precedence over the environment variable. Only put it here
+# in config.toml, which is git-ignored, never in this example file.
+[llm]
+provider = "anthropic"
+# model = "claude-opus-5-5"
+# api_key = ""
+# api_key_env = "ANTHROPIC_API_KEY"
+effort = "low"                 # low | medium | high | xhigh | max
+timeout_seconds = 60
+
+# Optional. Audio preview playback uses mpv (`brew install mpv`).
+[player]
+mpv_path = "mpv"
