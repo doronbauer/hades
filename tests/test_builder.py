@@ -9,7 +9,11 @@ import pytest
 from conftest import insert_track
 from hades.builder import (
     build_playlist,
+    _best_path,
+    _good_path,
+    _path_score,
     fmt_duration,
+    order_fixed,
     summarize,
     transition,
     validate,
@@ -175,3 +179,84 @@ def test_missing_a_default_length_is_only_a_warning(conn, music_dir: Path) -> No
     assert len(result.tracks) == 3
     assert result.unsatisfied == [] and result.status == "complete"
     assert any(w.startswith("default length not reached") for w in result.warnings)
+
+
+def test_order_fixed_by_bpm_keeps_every_track(conn, music_dir: Path) -> None:
+    ids = [insert_track(conn, music_dir, artist=f"A{i}", bpm=bpm)
+           for i, bpm in enumerate([132, None, 124, 128, 124])]
+    result = order_fixed([load_track(conn, i) for i in ids], harmonic=False)
+    assert [t.id for t in result.tracks] == [ids[2], ids[4], ids[3], ids[0], ids[1]]
+    assert result.unsatisfied == [] and result.spec.ordering.bpm_progression == "ascending"
+
+
+def test_order_fixed_harmonic_finds_the_smooth_chain(conn, music_dir: Path) -> None:
+    keys = ["10A", "8A", "11A", "9A", "12A"]  # the smooth order is 8A 9A 10A 11A 12A
+    ids = [insert_track(conn, music_dir, artist=f"A{i}", bpm=128, camelot=k)
+           for i, k in enumerate(keys)]
+    result = order_fixed([load_track(conn, i) for i in ids], harmonic=True)
+    got = [t.camelot for t in result.tracks]
+    assert got in (["8A", "9A", "10A", "11A", "12A"], ["12A", "11A", "10A", "9A", "8A"])
+    assert not any("key clash" in w for w in result.warnings)
+
+
+def test_order_fixed_reports_unavailable_tracks_without_dropping_them(conn, music_dir: Path) -> None:
+    ids = [insert_track(conn, music_dir, artist="A"),
+           insert_track(conn, music_dir, artist="B", create_file=False)]
+    result = order_fixed([load_track(conn, i) for i in ids], harmonic=True)
+    assert len(result.tracks) == 2 and result.unsatisfied == []
+    assert any("file unavailable" in w for w in result.warnings)
+
+
+def test_good_path_matches_exact_search_on_small_inputs() -> None:
+    import random
+
+    rng = random.Random(1)
+    for _ in range(20):
+        n = rng.randrange(3, 8)
+        score = [[rng.uniform(-1, 1) for _ in range(n)] for _ in range(n)]
+        exact = _best_path(score)
+        assert sorted(exact) == list(range(n))
+        assert _path_score(score, _good_path(score)) <= _path_score(score, exact) + 1e-9
+
+
+def test_all_matching_tracks_are_listed_without_a_default_length(conn, music_dir: Path) -> None:
+    for i in range(30):
+        insert_track(conn, music_dir, artist=f"A{i}", bpm=120 + i % 7)
+    insert_track(conn, music_dir, artist="A0", title="Track 1")  # the same song again
+    result = build(conn, {"selection": "all"})
+    assert len(result.tracks) == 30 and result.defaults == [] and result.unsatisfied == []
+    assert "1 matching track(s) left out: another file of the same song is listed" in \
+        result.warnings
+
+
+def test_all_matching_tracks_with_a_direction_are_sorted(conn, music_dir: Path) -> None:
+    for i, bpm in enumerate([126, 120, 124, 121, 140, 141, 125]):
+        insert_track(conn, music_dir, artist=f"A{i}", bpm=bpm)
+    result = build(conn, {"selection": "all",
+                          "ordering": {"bpm_progression": "ascending", "max_bpm_step": 2}})
+    assert [t.bpm for t in result.tracks] == [124, 125, 126], "the longest run without a gap > 2"
+    assert "4 matching track(s) left out by the BPM step rule" in result.warnings
+    result = build(conn, {"selection": "all", "ordering": {"bpm_progression": "descending"}})
+    assert [t.bpm for t in result.tracks] == [141, 140, 126, 125, 124, 121, 120]
+
+
+def test_maximum_bpm_step_is_a_hard_rule(conn, music_dir: Path) -> None:
+    for i, bpm in enumerate([120, 121, 122.5, 124, 125, 127, 135, 136, 137]):
+        insert_track(conn, music_dir, artist=f"A{i}", bpm=bpm)
+    result = build(conn, {"track_count": 6,
+                          "ordering": {"bpm_progression": "ascending", "max_bpm_step": 2}})
+    bpms = [t.bpm for t in result.tracks]
+    assert bpms == [120, 121, 122.5, 124, 125, 127], bpms
+    assert result.unsatisfied == []
+    too_long = build(conn, {"track_count": 8,
+                            "ordering": {"bpm_progression": "ascending", "max_bpm_step": 2}})
+    assert len(too_long.tracks) == 6
+    assert too_long.unsatisfied == ["6 tracks instead of the requested 8"]
+
+
+def test_step_rule_is_validated_after_edits(conn, music_dir: Path) -> None:
+    a = load_track(conn, insert_track(conn, music_dir, artist="A", bpm=120))
+    b = load_track(conn, insert_track(conn, music_dir, artist="B", bpm=125))
+    spec = parse_spec({"ordering": {"bpm_progression": "ascending", "max_bpm_step": 2}})
+    assert validate([a, b], spec) == ["#1→#2: BPM step +5.0 exceeds 2"]
+    assert validate([b, a], spec) == ["#1→#2: BPM step -5.0 exceeds 2"]

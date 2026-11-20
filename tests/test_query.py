@@ -111,3 +111,41 @@ def test_effective_values_and_flags_are_preserved(conn, music_dir: Path) -> None
     assert t.key == "Am" and t.camelot == "8A" and not t.key_reliable
     assert t.bpm == 174 and t.bpm_reliable and t.bpm_flag == "HALF_DOUBLE"
     assert t.created_date == date(2026, 5, 10)
+
+
+def _filters(*groups: list[dict]) -> dict:
+    return {"filters": [list(g) for g in groups]}
+
+
+def test_filters_combine_alternatives_and_negation(conn, music_dir: Path) -> None:
+    slow = insert_track(conn, music_dir, bpm=80, genre="Ambient")
+    fast = insert_track(conn, music_dir, bpm=160, genre="Techno")
+    fast_dnb = insert_track(conn, music_dir, bpm=172, genre="Drum & Bass")
+    insert_track(conn, music_dir, bpm=128, genre="House")
+    spec = parse_spec(_filters(
+        [{"field": "bpm", "op": "lt", "values": [90]}, {"field": "bpm", "op": "gt", "values": [150]}],
+        [{"field": "genre", "op": "eq", "values": ["techno"], "negate": True}]))
+    assert {t.id for t in find_candidates(conn, spec).tracks} == {slow, fast_dnb}
+    assert track_violations(load_track(conn, fast), spec) == ["not not (genre: techno)"]
+
+
+def test_missing_or_unreliable_values_never_match_and_are_reported(conn, music_dir: Path) -> None:
+    good = insert_track(conn, music_dir, camelot="8A")
+    insert_track(conn, music_dir, camelot="8A", key_flag="CONFLICT")
+    insert_track(conn, music_dir, camelot=None)
+    spec = parse_spec(_filters([{"field": "key", "op": "in", "values": ["8A"]}]))
+    pool = find_candidates(conn, spec)
+    assert [t.id for t in pool.tracks] == [good]
+    assert pool.warnings() == ["2 track(s) excluded: no certain key"]
+    negated = parse_spec(_filters([{"field": "key", "op": "eq", "values": ["9A"], "negate": True}]))
+    assert [t.id for t in find_candidates(conn, negated).tracks] == [good]
+
+
+def test_added_date_and_text_filters(conn, music_dir: Path) -> None:
+    jan = insert_track(conn, music_dir, title="Deep Night", created="2026-01-01T10:00:00+00:00")
+    insert_track(conn, music_dir, title="Night Shift", created="2025-12-31T10:00:00+00:00")
+    insert_track(conn, music_dir, title="Nightfall", created="2026-06-01T10:00:00+00:00")
+    spec = parse_spec(_filters(
+        [{"field": "added", "op": "between", "values": ["2026-01-01", "2026-12-31"]}],
+        [{"field": "title", "op": "eq", "values": ["night"]}]))
+    assert [t.id for t in find_candidates(conn, spec).tracks] == [jan]

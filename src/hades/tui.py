@@ -427,7 +427,7 @@ class HadesApp(App[None]):
         self.query_one(PlaylistTable).move_cursor(row=0)
 
     def start_again(self) -> None:
-        if self.playlist.spec is None:
+        if not self.playlist.generated:
             self.log_line("This playlist was not generated from a request, so there is "
                           "nothing to run again.", "yellow")
             return
@@ -469,7 +469,7 @@ class HadesApp(App[None]):
         self.query_one(PlaylistTable).move_cursor(row=0)
 
     def start_refinement(self) -> None:
-        if self.playlist.spec is None or not len(self.playlist):
+        if not self.playlist.generated or not len(self.playlist):
             self.log_line("Only generated playlists can be refined.", "yellow")
             return
         if self.busy:

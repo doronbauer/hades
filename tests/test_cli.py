@@ -200,3 +200,31 @@ def test_list_unknown_or_invalid_id(cli, tagged_library) -> None:
     assert code == 1 and "no track with ID 999" in err
     with pytest.raises(SystemExit):
         cli("list", "abc")
+
+
+def test_from_orders_ids_and_saves(cli, conn, music_dir: Path) -> None:
+    from conftest import insert_track
+
+    a = insert_track(conn, music_dir, artist="A", bpm=130, camelot="8A")
+    b = insert_track(conn, music_dir, artist="B", bpm=124, camelot="3B")
+    c = insert_track(conn, music_dir, artist="C", bpm=127, camelot="9A")
+
+    code, out, _ = cli("from", str(a), str(b), str(c))
+    assert code == 0
+    rows = [line.split()[1] for line in out.splitlines() if re.match(r"\s+\d+\s+\d+\s", line)]
+    assert rows == [str(b), str(c), str(a)]
+    assert "ascending BPM" in out
+
+    code, out, _ = cli("from", str(a), str(b), str(c), str(a), "-k", "-n", "Picked")
+    assert code == 0
+    assert "harmonic transitions" in out and "used once" in out and "Saved as 'Picked'" in out
+    code, _, err = cli("regenerate", "Picked")
+    assert code == 1 and "not generated from a request" in err
+
+
+def test_from_rejects_unknown_ids(cli, conn, music_dir: Path) -> None:
+    from conftest import insert_track
+
+    a = insert_track(conn, music_dir)
+    code, _, err = cli("from", str(a), "9999")
+    assert code == 1 and "9999" in err

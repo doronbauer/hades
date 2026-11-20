@@ -7,7 +7,11 @@ code decides membership during retrieval and during later validation
 
 A track whose value for a constrained field is missing never satisfies that
 constraint. BPM values that tags and analysis disagree on (flag CONFLICT,
-unless set manually) are treated as unknown when a BPM limit applies.
+unless set manually) are treated as unknown when a BPM limit applies; the same
+holds for unreliable keys in key filters.
+
+The free-form ``filters`` of a spec are evaluated in Python on loaded tracks
+(``filters_match``), again by the same code that validates playlists later.
 """
 
 from __future__ import annotations
@@ -20,11 +24,21 @@ import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from functools import cached_property
 from pathlib import Path
 
 from hades.keys import camelot_parts
 from hades.reconcile import CONFLICT, MANUAL, PARALLEL, UNRECOGNIZED
-from hades.spec import PlaylistSpec
+from hades.spec import (
+    DATE_FIELDS,
+    FIELD_LABELS,
+    FLAG_FIELDS,
+    KEY_FIELDS,
+    TEXT_FIELDS,
+    Condition,
+    PlaylistSpec,
+    describe_group,
+)
 
 # Canonical genre -> other spellings. Matching is on whole words, so "techno"
 # also matches "Minimal Techno" but "electro" does not match "Electronic".
@@ -63,14 +77,25 @@ class Track:
     file_created: str | None
     file_exists: bool = True
     album: str | None = None
+    year: int | None = None
+    format: str | None = None
+    loudness: float | None = None  # integrated LUFS from the latest analysis
 
-    @property
+    # Cached: the builder asks for these many times per candidate.
+    @cached_property
     def artist_names(self) -> frozenset[str]:
         return artist_names(self.artist)
 
-    @property
+    @cached_property
     def album_key(self) -> str | None:
         return normalize_text(self.album) or None if self.album else None
+
+    @cached_property
+    def identity(self) -> tuple[str, str] | None:
+        """Normalized (artist, title), to recognize the same song in two files."""
+        if self.artist and self.title:
+            return normalize_text(self.artist), normalize_text(self.title)
+        return None
 
     @property
     def available(self) -> bool:
@@ -209,7 +234,10 @@ _SELECT = """
 SELECT t.id, t.path, t.filename, t.directory, t.status, t.duration,
        t.effective_bpm, t.effective_bpm_source, t.bpm_flag,
        t.effective_key, t.effective_key_camelot, t.effective_key_source, t.key_flag,
-       t.effective_genre, t.file_created, g.artist, g.title, g.album
+       t.effective_genre, t.file_created, g.artist, g.title, g.album, g.year, t.format,
+       (SELECT a.loudness_lufs FROM audio_analysis a
+        WHERE a.track_id = t.id AND a.status = 'ok' AND a.content_signature = t.content_signature
+        ORDER BY a.analyzed_at DESC, a.id DESC LIMIT 1) AS loudness
 FROM tracks t
 LEFT JOIN track_tags g ON g.track_id = t.id
 """
@@ -225,7 +253,7 @@ def _track(row: sqlite3.Row, check_file: bool = True) -> Track:
         key_source=row["effective_key_source"], key_flag=row["key_flag"],
         genre=row["effective_genre"], file_created=row["file_created"],
         file_exists=os.path.isfile(row["path"]) if check_file else True,
-        album=row["album"],
+        album=row["album"], year=row["year"], format=row["format"], loudness=row["loudness"],
     )
 
 
@@ -261,9 +289,10 @@ def _conditions(spec: PlaylistSpec) -> list[tuple[str, str, tuple[object, ...]]]
     if spec.created_before:
         conds.append(("date", "hades_local_date(t.file_created) < ?",
                       (spec.created_before.isoformat(),)))
-    if spec.bpm is not None:
+    if spec.bpm is not None or spec.ordering.max_bpm_step is not None:
         conds.append(("bpm_known", "t.effective_bpm IS NOT NULL", ()))
         conds.append(("bpm_trusted", _BPM_TRUSTED, ()))
+    if spec.bpm is not None:
         if spec.bpm.min is not None:
             conds.append(("bpm", "t.effective_bpm >= ?", (spec.bpm.min,)))
         if spec.bpm.max is not None:
@@ -305,8 +334,12 @@ def find_candidates(conn: sqlite3.Connection, spec: PlaylistSpec) -> CandidatePo
     rows = conn.execute(f"{_SELECT} WHERE {sql} ORDER BY t.id", params).fetchall()
     pool = CandidatePool([])
     for row in rows:
-        track = _track(row)
-        if track.file_exists:
+        track = _track(row, check_file=False)
+        if not filters_match(track, spec.filters):
+            if missing := _missing_for_filters(track, spec.filters):
+                pool.excluded[f"no {' or '.join(missing)}"] += 1
+            continue
+        if os.path.isfile(track.path):
             pool.tracks.append(track)
         else:
             pool.excluded["file not found on disk"] += 1
@@ -342,12 +375,12 @@ def track_violations(track: Track, spec: PlaylistSpec) -> list[str]:
         elif (spec.created_after and created <= spec.created_after) or (
                 spec.created_before and created >= spec.created_before):
             out.append(f"created {created}")
-    if spec.bpm is not None:
+    if spec.bpm is not None or spec.ordering.max_bpm_step is not None:
         if track.bpm is None:
             out.append("no BPM")
         elif not track.bpm_reliable:
             out.append("conflicting BPM")
-        else:
+        elif spec.bpm is not None:
             if spec.bpm.min is not None and track.bpm < spec.bpm.min:
                 out.append(f"BPM {track.bpm:.0f} < {spec.bpm.min:g}")
             if spec.bpm.max is not None and track.bpm > spec.bpm.max:
@@ -360,4 +393,98 @@ def track_violations(track: Track, spec: PlaylistSpec) -> list[str]:
         out.append("artist not requested")
     if spec.exclude_artists and artist_matches(track.artist, spec.exclude_artists):
         out.append("excluded artist")
+    for group in spec.filters:
+        if not any(condition_holds(track, c) for c in group):
+            missing = _missing_for_filters(track, [group])
+            out.append(f"no {' or '.join(missing)}" if missing else f"not {describe_group(group)}")
     return out
+
+
+# --------------------------------------------------------------------------- free-form filters
+
+
+def field_value(track: Track, name: str) -> object:
+    """The value a filter condition tests; None if missing or unreliable."""
+    if name == "bpm":
+        return track.bpm if track.bpm_reliable else None
+    if name == "key":
+        return track.camelot if track.key_reliable else None
+    if name == "duration_minutes":
+        return track.duration / 60 if track.duration else None
+    if name == "loudness_lufs":
+        return track.loudness
+    if name == "added":
+        return track.created_date
+    if name == "folder":
+        return track.directory
+    if name == "key_reliable":
+        return track.key_reliable
+    if name == "bpm_reliable":
+        return track.bpm_reliable
+    return getattr(track, name)  # genre, artist, title, album, year, format
+
+
+def condition_holds(track: Track, c: Condition) -> bool | None:
+    """Whether the track satisfies the condition; None if the value is missing."""
+    v = field_value(track, c.field)
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    result = _test(c, v)
+    return not result if c.negate else result
+
+
+def _test(c: Condition, v: object) -> bool:
+    f, vals = c.field, c.values
+    if f in FLAG_FIELDS:
+        return v == vals[0]
+    if f in KEY_FIELDS:
+        return v in vals
+    if f in TEXT_FIELDS:
+        text = str(v)
+        texts = [str(x) for x in vals]
+        if f == "genre":
+            return genre_matches(text, texts)
+        if f == "artist":
+            return artist_matches(text, texts)
+        if f == "folder":
+            return any(folder_matches(text, x) for x in texts)
+        if f == "format":
+            return text.casefold() in {x.casefold() for x in texts}
+        hay = normalize_text(text)  # title, album: whole words
+        return any(_contains_words(hay, normalize_text(x)) for x in texts)
+    if f in DATE_FIELDS:
+        x: list = [date.fromisoformat(str(a)) for a in vals]
+    else:
+        x = [float(a) for a in vals]  # type: ignore[arg-type]
+        v = float(v)  # type: ignore[arg-type]
+    op = c.op
+    if op == "between":
+        return x[0] <= v <= x[1]  # type: ignore[operator]
+    if op in ("eq", "in"):
+        if f in DATE_FIELDS:
+            return v in x
+        return any(round(v) == round(a) for a in x)  # type: ignore[call-overload]
+    return {"lt": v < x[0], "le": v <= x[0], "gt": v > x[0],  # type: ignore[operator]
+            "ge": v >= x[0]}[op]  # type: ignore[operator]
+
+
+def filters_match(track: Track, filters: list[list[Condition]]) -> bool:
+    """Every group has at least one condition that holds."""
+    return all(any(condition_holds(track, c) for c in group) for group in filters)
+
+
+def _missing_for_filters(track: Track, filters: list[list[Condition]]) -> list[str]:
+    """Labels of missing fields that make the track fail, if missing data is the only reason."""
+    missing: list[str] = []
+    for group in filters:
+        results = [condition_holds(track, c) for c in group]
+        if any(results):
+            continue
+        absent = [c for c, r in zip(group, results) if r is None]
+        if not absent:
+            return []  # fails on actual values
+        for c in absent:
+            label = {"bpm": "trusted BPM", "key": "certain key"}.get(c.field, FIELD_LABELS[c.field])
+            if label not in missing:
+                missing.append(label)
+    return missing

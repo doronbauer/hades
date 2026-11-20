@@ -90,6 +90,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save", metavar="NAME", help="save the new version under this name")
     p.set_defaults(handler=cmd_regenerate)
 
+    p = sub.add_parser("from",
+                       help="create a playlist from track IDs, ordered by BPM or harmonically")
+    p.add_argument("track_ids", nargs="+", type=_positive_int, metavar="ID",
+                   help="track IDs (see `hades search`)")
+    p.add_argument("-k", "--harmonic", action="store_true",
+                   help="order for harmonic progression instead of lowest to highest BPM")
+    p.add_argument("-n", "--name", metavar="NAME",
+                   help="save the playlist under this name (also writes NAME.m3u)")
+    p.set_defaults(handler=cmd_from)
+
     p = sub.add_parser("playlists", help="list saved playlists, or show one")
     p.add_argument("name", nargs="?", help="playlist to show")
     p.add_argument("--export", nargs="?", const="", metavar="PATH",
@@ -293,6 +303,25 @@ def cmd_regenerate(args: argparse.Namespace, config: Config, conn: sqlite3.Conne
         return 1
     return _show_and_save(conn, config, Playlist.from_result(result, previous.prompt), result,
                           args.save)
+
+
+def cmd_from(args: argparse.Namespace, config: Config, conn: sqlite3.Connection) -> int:
+    from hades.builder import order_fixed
+    from hades.playlist import Playlist
+    from hades.query import load_tracks
+
+    ids = list(dict.fromkeys(args.track_ids))
+    tracks = load_tracks(conn, ids)
+    unknown = [str(i) for i in ids if i not in tracks]
+    if unknown:
+        print(f"error: no track with ID {', '.join(unknown)} in the library", file=sys.stderr)
+        return 1
+    result = order_fixed([tracks[i] for i in ids], harmonic=args.harmonic)
+    if len(ids) < len(args.track_ids):
+        result.warnings.insert(0, "repeated track IDs are used once")
+    playlist = Playlist.from_result(result, None)
+    playlist.status = "manual"  # hand-picked: there is no request to run again
+    return _show_and_save(conn, config, playlist, result, args.name)
 
 
 def _show_and_save(conn: sqlite3.Connection, config: Config, playlist: Playlist,

@@ -12,6 +12,9 @@ duration) satisfiable. Soft preferences only influence the score:
 * Variety: repeating an artist is penalized; the same artist+title is never
   used twice.
 
+A maximum BPM step is a hard rule: the walk only continues with tracks within
+the step (and not against the requested direction), so it may end early.
+
 Ties are broken by track ID, so the same pool and spec always give the same
 playlist.
 """
@@ -24,7 +27,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from hades.keys import harmonic_compatibility
-from hades.query import CandidatePool, Track, normalize_text, track_violations
+from hades.query import CandidatePool, Track, track_violations
 from hades.spec import Ordering, PlaylistSpec
 
 DEFAULT_DURATION_MINUTES = 60.0
@@ -32,6 +35,8 @@ NEUTRAL_KEY_SCORE = 0.35       # unknown/unreliable key: below any "compatible" 
 GOOD_KEY_SCORE = 0.5           # at or above: a transition counts as harmonic
 MAX_BPM_STEP_PCT = 6.0         # a bigger tempo change counts as a jump
 ATTEMPTS = 8                   # starting tracks tried
+LARGE_LIST = 80                # above this many tracks: no neighbour swapping
+MAX_TRANSITION_WARNINGS = 10   # more are summarized by kind
 SAME_ARTIST_PENALTY = 1.5      # back-to-back tracks sharing an artist
 SAME_ALBUM_PENALTY = 1.0       # back-to-back tracks from the same album
 REPEAT_ARTIST_PENALTY = 0.6    # per earlier track by the same artist anywhere in the set
@@ -121,6 +126,9 @@ def transition(a: Track, b: Track, ordering: Ordering) -> Transition:
         elif not direction:
             score -= abs(pct) / 20  # mild preference for steady tempo
 
+    if (step := step_violation(a, b, ordering)) is not None:
+        issues.append(step)
+
     shared = a.artist_names & b.artist_names
     if shared:
         score -= SAME_ARTIST_PENALTY
@@ -139,15 +147,29 @@ def transition(a: Track, b: Track, ordering: Ordering) -> Transition:
     return Transition(score, tuple(issues))
 
 
+def step_violation(a: Track, b: Track, ordering: Ordering) -> str | None:
+    """How the move a -> b breaks the maximum BPM step rule, or None if it doesn't."""
+    limit = ordering.max_bpm_step
+    if limit is None:
+        return None
+    if a.bpm is None or b.bpm is None:
+        return "BPM unknown"
+    diff = b.bpm - a.bpm
+    if abs(diff) > limit + 1e-9:
+        return f"BPM step {diff:+.1f} exceeds {limit:g}"
+    direction = {"ascending": 1, "descending": -1}.get(ordering.bpm_progression, 0)
+    if diff * direction < -1e-9:
+        return f"BPM {'drop' if direction > 0 else 'rise'} {diff:+.1f}"
+    return None
+
+
 def transitions(tracks: list[Track], ordering: Ordering) -> list[Transition]:
     """transitions[i] describes the move into tracks[i + 1]."""
     return [transition(a, b, ordering) for a, b in zip(tracks, tracks[1:])]
 
 
 def _identity(t: Track) -> tuple[str, str] | None:
-    if t.artist and t.title:
-        return normalize_text(t.artist), normalize_text(t.title)
-    return None
+    return t.identity
 
 
 # --------------------------------------------------------------------------- validation
@@ -168,6 +190,9 @@ def validate(tracks: list[Track], spec: PlaylistSpec) -> list[str]:
         for name, n in sorted(counts.items()):
             if n > spec.max_tracks_per_artist:
                 out.append(f"{n} tracks by {name} (at most {spec.max_tracks_per_artist})")
+    for pos, (a, b) in enumerate(zip(tracks, tracks[1:]), start=1):
+        if (step := step_violation(a, b, spec.ordering)) is not None:
+            out.append(f"#{pos}→#{pos + 1}: {step}")
     if spec.track_count is not None and len(tracks) != spec.track_count:
         out.append(f"{len(tracks)} tracks instead of the requested {spec.track_count}")
     lo, hi = spec.duration_bounds_seconds
@@ -199,8 +224,11 @@ class _Targets:
 
 
 def apply_defaults(spec: PlaylistSpec) -> tuple[PlaylistSpec, list[str]]:
-    """Fill in a length when neither a count nor a duration was requested. Filters are never added."""
-    if spec.track_count is None and spec.duration_minutes is None:
+    """Fill in a length when neither a count nor a duration was requested. Filters are never added.
+
+    Not for "all matching tracks", which has no length by definition.
+    """
+    if spec.selection == "set" and spec.track_count is None and spec.duration_minutes is None:
         effective = spec.model_copy(update={"duration_minutes": DEFAULT_DURATION_MINUTES,
                                             "duration_mode": "target"})
         return effective, [f"no length requested: aiming for about "
@@ -230,6 +258,39 @@ def _bpm_plan(pool: list[Track], spec: PlaylistSpec, n: int) -> list[float] | No
     else:
         plan = [lo + (hi - lo) * i / (n - 1) for i in range(n)]
     return plan if direction == "ascending" else plan[::-1]
+
+
+def _stepped_starts(pool: list[Track], spec: PlaylistSpec, n: int,
+                    rng: random.Random | None) -> list[tuple[Track, list[float]]]:
+    """Starts spread over the tempo range for a progression under a maximum BPM step.
+
+    Each start gets its own ramp that rises (or falls) by at most half the step per
+    track, so the walk has slack and sparse tempo regions don't end it at once.
+    """
+    step = spec.ordering.max_bpm_step
+    assert step is not None
+    sign = 1 if spec.ordering.bpm_progression == "ascending" else -1
+    known = sorted((t for t in pool if t.bpm is not None), key=lambda t: (sign * t.bpm, t.id))
+    if not known:
+        return []
+    far = known[-1 - len(known) // 10].bpm  # the 90th percentile in the walking direction
+    if spec.bpm is not None:
+        limit = spec.bpm.max if sign > 0 else spec.bpm.min
+        if limit is not None:
+            far = min(far, limit) if sign > 0 else max(far, limit)
+    k = ATTEMPTS * 2
+    if rng is None:
+        stride = max(len(known) // k, 1)
+        starts = known[::stride][:k]
+    else:
+        starts = rng.sample(known, min(k, len(known)))
+    out = []
+    for t in starts:
+        assert t.bpm is not None and far is not None
+        span = max(sign * (far - t.bpm), 0.0)
+        slope = min(step / 2, span / (n - 1)) if n > 1 else 0.0
+        out.append((t, [t.bpm + sign * slope * i for i in range(max(n, 1))]))
+    return out
 
 
 class _Attempt:
@@ -279,6 +340,9 @@ class _Attempt:
                 return False
         return True
 
+    def _step_ok(self, t: Track) -> bool:
+        return step_violation(self.seq[-1], t, self.spec.ordering) is None
+
     def _next_to_last_ok(self, t: Track) -> bool:
         """No shared artist and no shared album with the previous track."""
         last = self.seq[-1]
@@ -299,6 +363,8 @@ class _Attempt:
     def grow(self) -> None:
         while not self.done():
             usable = [t for t in self.pool if self._usable(t)]
+            if self.spec.ordering.max_bpm_step is not None:
+                usable = [t for t in usable if self._step_ok(t)]
             if not usable:
                 return
             remaining = sorted(t.duration or 0.0 for t in usable)
@@ -323,7 +389,10 @@ class _Attempt:
     def rank(self) -> tuple[float, ...]:
         violations = validate(self.seq, self.spec)
         mean = self.score / max(len(self.seq) - 1, 1)
-        return (-len(violations), len(self.seq) if self.targets.count else 0, mean)
+        # Longer is better when the length is not a matter of duration alone.
+        by_length = (self.targets.count is not None or self.spec.selection == "all"
+                     or self.spec.ordering.max_bpm_step is not None)
+        return (-len(violations), len(self.seq) if by_length else 0, mean)
 
 
 def _neighbours_clash(a: Track, b: Track) -> bool:
@@ -339,9 +408,14 @@ def separate_neighbours(tracks: list[Track], ordering: Ordering) -> list[Track]:
     among those, the one with the smoothest transitions wins.
     """
     seq = list(tracks)
+    if len(seq) > LARGE_LIST:
+        return seq  # quadratic in swaps times length: too slow for long lists
 
     def clashes(s: list[Track]) -> int:
         return sum(_neighbours_clash(a, b) for a, b in zip(s, s[1:]))
+
+    def steps_ok(s: list[Track]) -> bool:
+        return all(step_violation(a, b, ordering) is None for a, b in zip(s, s[1:]))
 
     def smoothness(s: list[Track]) -> float:
         return sum(t.score for t in transitions(s, ordering))
@@ -354,7 +428,7 @@ def separate_neighbours(tracks: list[Track], ordering: Ordering) -> list[Track]:
                 trial = list(seq)
                 trial[i], trial[j] = trial[j], trial[i]
                 n = clashes(trial)
-                if n < current:
+                if n < current and (ordering.max_bpm_step is None or steps_ok(trial)):
                     key = (n, smoothness(trial))
                     if best is None or (-key[0], key[1]) > (-best[0], best[1]):
                         best = (key[0], key[1], trial)
@@ -400,15 +474,24 @@ def build_playlist(requested: PlaylistSpec, pool: CandidatePool, *, seed: int | 
         result.unsatisfied.append("no tracks in the library match the requested filters")
         return result
 
+    if spec.selection == "all" and spec.ordering.bpm_progression != "none":
+        return _finish(result, _all_by_tempo(candidates, spec), candidates, requested, spec)
+
     durations = [t.duration for t in candidates if t.duration]
     if targets.count is not None:
         n_est = targets.count
+    elif spec.selection == "all":
+        n_est = len(candidates)
     else:
         n_est = max(1, round((targets.goal or 0) / statistics.median(durations)))
-    plan = _bpm_plan(candidates, spec, n_est)
+    if spec.ordering.max_bpm_step is not None and spec.ordering.bpm_progression != "none":
+        starts = _stepped_starts(candidates, spec, n_est, rng)
+    else:
+        plan = _bpm_plan(candidates, spec, n_est)
+        starts = [(t, plan) for t in _starts(candidates, plan, rng)]
 
     best: _Attempt | None = None
-    for start in _starts(candidates, plan, rng):
+    for start, plan in starts:
         if targets.hi is not None and (start.duration or 0) > targets.hi:
             continue
         attempt = _Attempt(start, candidates, spec, targets, plan, rng, avoid)
@@ -419,13 +502,81 @@ def build_playlist(requested: PlaylistSpec, pool: CandidatePool, *, seed: int | 
         result.unsatisfied.append("every matching track is longer than the duration limit")
         return result
 
-    result.tracks = separate_neighbours(best.seq, spec.ordering)
+    return _finish(result, separate_neighbours(best.seq, spec.ordering), candidates,
+                   requested, spec)
+
+
+def _finish(result: BuildResult, tracks: list[Track], candidates: list[Track],
+            requested: PlaylistSpec, spec: PlaylistSpec) -> BuildResult:
+    result.tracks = tracks
     # Only what the user asked for can be unmet; missing a default length is a warning.
     result.unsatisfied.extend(validate(result.tracks, requested))
     result.warnings.extend(f"default length not reached: {v}"
                            for v in validate(result.tracks, spec) if v not in result.unsatisfied)
     result.warnings.extend(quality_warnings(result.tracks, spec))
+    if spec.selection == "all":
+        result.warnings.extend(_left_out(candidates, result.tracks, spec))
     return result
+
+
+def _all_by_tempo(pool: list[Track], spec: PlaylistSpec) -> list[Track]:
+    """Every matching track in tempo order: the only order that leaves none behind.
+
+    With a maximum step, the sorted list is cut at gaps wider than the step and the
+    longest run is kept. Tracks of equal tempo are ordered for smooth transitions.
+    """
+    ordering = spec.ordering
+    sign = 1 if ordering.bpm_progression == "ascending" else -1
+    seq: list[Track] = []
+    seen: set[tuple[str, str]] = set()
+    artists: Counter[str] = Counter()
+    limit = spec.max_tracks_per_artist
+    for t in sorted(pool, key=lambda t: (t.bpm is None, sign * (t.bpm or 0.0), t.id)):
+        if t.identity is not None and t.identity in seen:
+            continue
+        if limit is not None and any(artists[n] >= limit for n in t.artist_names):
+            continue
+        seq.append(t)
+        if t.identity is not None:
+            seen.add(t.identity)
+        artists.update(t.artist_names)
+    if ordering.max_bpm_step is not None and seq:
+        runs, run = [], [seq[0]]
+        for a, b in zip(seq, seq[1:]):
+            if step_violation(a, b, ordering) is None:
+                run.append(b)
+            else:
+                runs.append(run)
+                run = [b]
+        runs.append(run)
+        seq = max(runs, key=len)
+    out: list[Track] = []
+    i = 0
+    while i < len(seq):  # reorder each group of equal tempo
+        j = i
+        while j < len(seq) and seq[j].bpm == seq[i].bpm:
+            j += 1
+        group = seq[i:j]
+        out += _smoothest_order(group, ordering) if len(group) > 2 else group
+        i = j
+    return out
+
+
+def _left_out(candidates: list[Track], chosen: list[Track], spec: PlaylistSpec) -> list[str]:
+    """Why matching tracks are missing from an "all matching tracks" list."""
+    used = {t.id for t in chosen}
+    identities = {t.identity for t in chosen if t.identity is not None}
+    rest = [t for t in candidates if t.id not in used]
+    dupes = sum(1 for t in rest if t.identity in identities)
+    out = []
+    if dupes:
+        out.append(f"{dupes} matching track(s) left out: another file of the same song is listed")
+    if other := len(rest) - dupes:
+        rules = [r for r, on in (("the BPM step rule", spec.ordering.max_bpm_step is not None),
+                                 ("the per-artist limit", spec.max_tracks_per_artist is not None))
+                 if on]
+        out.append(f"{other} matching track(s) left out by {' and '.join(rules) or 'the rules'}")
+    return out
 
 
 def build_variation(requested: PlaylistSpec, pool: CandidatePool, previous: list[int],
@@ -454,11 +605,106 @@ def build_variation(requested: PlaylistSpec, pool: CandidatePool, previous: list
     return min(variants, key=lambda r: (overlap(r), [-q for q in quality(r)]))
 
 
+# --------------------------------------------------------------------------- fixed track lists
+
+EXACT_ORDER_LIMIT = 12  # up to this many tracks, harmonic ordering tries every order
+
+
+def order_fixed(tracks: list[Track], harmonic: bool) -> BuildResult:
+    """Order exactly the given tracks: by ascending tempo, or for the smoothest transitions.
+
+    Nothing is added or dropped; problems (e.g. unavailable files) are only warnings.
+    """
+    ordering = Ordering(harmonic_compatibility=True) if harmonic \
+        else Ordering(bpm_progression="ascending")
+    spec = PlaylistSpec(ordering=ordering)
+    if harmonic:
+        seq = _smoothest_order(tracks, ordering)
+    else:  # unknown tempo last; equal tempos keep the given order
+        seq = sorted(tracks, key=lambda t: (t.bpm is None, t.bpm or 0.0))
+    result = BuildResult(spec=spec, effective_spec=spec, tracks=seq, candidate_count=len(tracks))
+    result.warnings.extend(validate(seq, spec))
+    result.warnings.extend(quality_warnings(seq, spec))
+    return result
+
+
+def _smoothest_order(tracks: list[Track], ordering: Ordering) -> list[Track]:
+    n = len(tracks)
+    if n <= 2:
+        return list(tracks)
+    score = [[transition(a, b, ordering).score if a is not b else 0.0 for b in tracks]
+             for a in tracks]
+    path = _best_path(score) if n <= EXACT_ORDER_LIMIT else _good_path(score)
+    return [tracks[i] for i in path]
+
+
+def _path_score(score: list[list[float]], path: list[int]) -> float:
+    return sum(score[a][b] for a, b in zip(path, path[1:]))
+
+
+def _best_path(score: list[list[float]]) -> list[int]:
+    """The order with the highest total transition score (Held-Karp, any start and end)."""
+    n = len(score)
+    full = (1 << n) - 1
+    best = [[float("-inf")] * n for _ in range(1 << n)]
+    prev = [[-1] * n for _ in range(1 << n)]
+    for i in range(n):
+        best[1 << i][i] = 0.0
+    for mask in range(1, full + 1):
+        row = best[mask]
+        for last in range(n):
+            total = row[last]
+            if total == float("-inf"):
+                continue
+            for nxt in range(n):
+                if mask >> nxt & 1:
+                    continue
+                cand = total + score[last][nxt]
+                nmask = mask | 1 << nxt
+                if cand > best[nmask][nxt]:
+                    best[nmask][nxt], prev[nmask][nxt] = cand, last
+    last = max(range(n), key=lambda i: best[full][i])
+    path, mask = [], full
+    while last != -1:
+        path.append(last)
+        mask, last = mask & ~(1 << last), prev[mask][last]
+    return path[::-1]
+
+
+def _good_path(score: list[list[float]]) -> list[int]:
+    """Greedy walk from every start, improved by reversing segments while that helps."""
+    n = len(score)
+    best: list[int] | None = None
+    for start in range(n):
+        path, left = [start], set(range(n)) - {start}
+        while left:
+            nxt = max(sorted(left), key=lambda j: score[path[-1]][j])
+            path.append(nxt)
+            left.remove(nxt)
+        if best is None or _path_score(score, path) > _path_score(score, best):
+            best = path
+    assert best is not None
+    improved = True
+    while improved:
+        improved = False
+        for i in range(n - 1):
+            for j in range(i + 2, n + 1):
+                trial = best[:i] + best[i:j][::-1] + best[j:]
+                if _path_score(score, trial) > _path_score(score, best) + 1e-9:
+                    best, improved = trial, True
+    return best
+
+
 def quality_warnings(tracks: list[Track], spec: PlaylistSpec) -> list[str]:
     out: list[str] = []
     for i, tr in enumerate(transitions(tracks, spec.ordering), start=2):
         if tr.issues:
             out.append(f"#{i - 1}→#{i}: {', '.join(tr.issues)}")
+    if len(out) > MAX_TRANSITION_WARNINGS:  # long lists: counts per kind; the notes have details
+        kinds = Counter(" ".join(issue.split()[:2]) for tr in transitions(tracks, spec.ordering)
+                        for issue in tr.issues)
+        out = [f"{len(out)} transitions have issues: "
+               + ", ".join(f"{kind} ×{n}" for kind, n in kinds.most_common())]
     if spec.ordering.harmonic_compatibility:
         n = sum(1 for t in tracks if not t.key_reliable)
         if n:

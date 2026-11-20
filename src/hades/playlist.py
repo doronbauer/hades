@@ -61,6 +61,11 @@ class Playlist:
         return None
 
     @property
+    def generated(self) -> bool:
+        """Built from a request that can be run again or refined (not hand-picked)."""
+        return self.spec is not None and self.status != "manual"
+
+    @property
     def stats(self) -> Stats:
         return summarize(self.tracks)
 

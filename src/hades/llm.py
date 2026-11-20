@@ -25,7 +25,14 @@ from hades.builder import (
 )
 from hades.config import LLMSettings
 from hades.query import Track
-from hades.spec import PlaylistSpec, SpecError, parse_spec
+from hades.spec import (
+    FILTER_FIELDS,
+    FILTER_OPS,
+    PlaylistSpec,
+    SpecError,
+    describe_group,
+    parse_spec,
+)
 
 SHORTLIST_SIZE = 60
 
@@ -171,18 +178,36 @@ def _nullable(schema: dict[str, Any]) -> dict[str, Any]:
 
 _STRINGS = {"type": "array", "items": {"type": "string"}}
 
+# Flat on purpose (structured outputs don't allow recursive schemas): a list of
+# groups that must all hold, each a list of conditions of which one must hold.
+_CONDITION = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["field", "op", "values", "negate"],
+    "properties": {
+        "field": {"type": "string", "enum": list(FILTER_FIELDS)},
+        "op": {"type": "string", "enum": list(FILTER_OPS)},
+        "values": {"type": "array",
+                   "items": {"anyOf": [{"type": "string"}, {"type": "number"},
+                                       {"type": "boolean"}]}},
+        "negate": {"type": "boolean"},
+    },
+}
+
 INTERPRET_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["error", "spec"],
+    "required": ["error", "unsupported", "spec"],
     "properties": {
         "error": _nullable({"type": "string"}),
+        "unsupported": _STRINGS,
         "spec": _nullable({
             "type": "object",
             "additionalProperties": False,
             "required": ["genre", "created_after", "created_before", "bpm", "duration_minutes",
                          "duration_mode", "duration_tolerance_minutes", "track_count", "folder",
-                         "artists", "exclude_artists", "max_tracks_per_artist", "ordering"],
+                         "artists", "exclude_artists", "max_tracks_per_artist", "selection",
+                         "filters", "ordering"],
             "properties": {
                 "genre": _STRINGS,
                 "created_after": _nullable({"type": "string", "format": "date"}),
@@ -202,14 +227,17 @@ INTERPRET_SCHEMA: dict[str, Any] = {
                 "artists": _STRINGS,
                 "exclude_artists": _STRINGS,
                 "max_tracks_per_artist": _nullable({"type": "integer"}),
+                "selection": {"type": "string", "enum": ["set", "all"]},
+                "filters": {"type": "array", "items": {"type": "array", "items": _CONDITION}},
                 "ordering": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["bpm_progression", "harmonic_compatibility"],
+                    "required": ["bpm_progression", "harmonic_compatibility", "max_bpm_step"],
                     "properties": {
                         "bpm_progression": {"type": "string",
                                             "enum": ["ascending", "descending", "none"]},
                         "harmonic_compatibility": {"type": "boolean"},
+                        "max_bpm_step": _nullable({"type": "number"}),
                     },
                 },
             },
@@ -218,20 +246,29 @@ INTERPRET_SCHEMA: dict[str, Any] = {
 }
 
 INTERPRET_SYSTEM = """\
-You translate a DJ's request for a playlist from their local music library into a \
-structured query. Output only what the request states; never invent a filter.
+You translate a DJ's request about their local music library into a structured query. \
+Capture everything the request states and nothing it doesn't; never invent a filter.
 
-Fields (use null or [] for anything the request does not mention):
+Selection:
+- selection: "all" only when the user explicitly wants every matching track ("all the \
+tracks from 2026", "every track under 90 BPM", "list/show me the tracks ...") and gives no \
+length. Otherwise "set": a playlist of some length, including whenever the request is \
+about how tracks follow each other (tempo progression, steps, transitions) without \
+saying "all". With "set" and no length, the app picks a default length.
+
+Simple fields (use null or [] for anything not mentioned):
 - genre: genre names exactly as the user said them (e.g. "drum & bass", "techno"). \
 Several genres mean "any of these".
 - created_after / created_before: EXCLUSIVE calendar-date bounds (YYYY-MM-DD) on when \
-the file was added to the library. Words like "added", "new", "got", "bought" refer to this. \
-Interpret calendar periods as whole periods: "after March 2026" -> created_after \
-"2026-03-31"; "before March 2026" -> created_before "2026-03-01"; "in March 2026" -> \
-created_after "2026-02-28" and created_before "2026-04-01"; "since 1 May 2026" (inclusive) \
--> created_after "2026-04-30". Resolve relative dates ("this year", "last month") against \
-today's date, given below. Never use release dates.
-- bpm: {min, max}; "below 160" -> max 160, "above 125" -> min 125, "125 to 135" -> both.
+the file was added to the library. Words like "added", "new", "got", "bought", or a bare \
+period such as "tracks from 2026", refer to this. Interpret calendar periods as whole \
+periods: "after March 2026" -> created_after "2026-03-31"; "before March 2026" -> \
+created_before "2026-03-01"; "in March 2026" / "from March 2026" -> created_after \
+"2026-02-28" and created_before "2026-04-01"; "since 1 May 2026" (inclusive) -> \
+created_after "2026-04-30". Resolve relative dates ("this year", "last month") against \
+today's date, given below.
+- bpm: ONE contiguous range {min, max}; "below 160" -> max 160, "above 125" -> min 125, \
+"125 to 135" -> both. For ranges that don't overlap, use filters instead.
 - duration_minutes + duration_mode: "a one-hour playlist", "about 90 minutes", "a 90-minute \
 set" -> mode "target"; "no longer than an hour", "at most 45 minutes", "under an hour" -> \
 mode "max". duration_tolerance_minutes: only if the user states one, else null.
@@ -239,17 +276,42 @@ mode "max". duration_tolerance_minutes: only if the user states one, else null.
 - folder: a directory name or path, only if the user restricts to one.
 - artists / exclude_artists: only artists the user names.
 - max_tracks_per_artist: only if the user limits repeats: "one track per artist", "no \
-artist twice", "every track by a different artist" -> 1; "at most 2 per artist" -> 2. \
-Otherwise null (consecutive tracks by the same artist are avoided anyway).
-- ordering.bpm_progression: "ascending" for increasing tempo, "starting slow and getting \
-faster", "build up"; "descending" for the reverse; otherwise "none".
-- ordering.harmonic_compatibility: true if the user asks for harmonic/key-compatible/\
-smooth harmonic transitions or mixing in key.
+artist twice" -> 1; "at most 2 per artist" -> 2. Otherwise null.
 
-Set "error" (and spec null) only if the request is not a playlist request, is \
-self-contradictory (e.g. "below 120 BPM and above 140 BPM"), or is impossible to express \
-with these fields. Explain the problem in one or two plain sentences for the user. \
-Never resolve a contradiction by changing what the user asked for."""
+filters: for anything the simple fields can't say: alternatives ("or"), negations, and \
+these fields. Every group must hold; a group holds if ANY of its conditions holds.
+- Fields: bpm, year (release year tag), duration_minutes (track length), loudness_lufs \
+(integrated loudness, e.g. -8 is loud, -14 is quiet), added (date the file was added; \
+inclusive YYYY-MM-DD values), genre, artist, title, album (whole-word matches), format \
+(MP3, FLAC, AIFF, WAV, M4A), folder, key (Camelot like "8A" or names like "A minor"), \
+key_reliable / bpm_reliable (true/false: tag and analysis agree).
+- ops: lt, le, gt, ge (one value), between (two values, inclusive), eq (one value), in \
+(several values). Text and key fields use eq or in and match any listed value. \
+negate: true inverts a condition.
+- "under 90 or above 150 BPM" -> one group: [bpm lt 90, bpm gt 150]. People also say \
+"under 90 and above 150": conditions that no track can meet at once are alternatives, \
+so this is the same single group. "tracks in 8A or \
+9A, not techno" -> two groups: [key in 8A, 9A] and [genre eq techno, negate]. "added in \
+2024 or 2026" -> one group: [added between 2024-01-01 and 2024-12-31, added between \
+2026-01-01 and 2026-12-31]. "only tracks with a certain key" -> [key_reliable eq true].
+
+ordering:
+- bpm_progression: "ascending" for increasing tempo, "starting slow and getting faster", \
+"build up", and for a tempo progression with no direction given ("progress in tempo"); \
+"descending" for slowing down or winding down; otherwise "none".
+- harmonic_compatibility: true if the user asks for harmonic/key-compatible/smooth \
+harmonic transitions or mixing in key.
+- max_bpm_step: the largest BPM change allowed between neighbouring tracks, if the user \
+limits it ("no more than 2 BPM from track to track" -> 2). Otherwise null.
+
+unsupported: short phrases quoting any part of the request you could not express with \
+these fields (e.g. a mood, "vocals only"). Still return a spec for the rest. Never \
+resolve a contradiction by silently changing what the user asked for: list the part you \
+could not honour here.
+
+Set "error" (and spec null) only if the text is not a request about tracks or playlists \
+at all, or if nothing in it can be expressed. Explain the problem in one or two plain \
+sentences."""
 
 
 @dataclass(frozen=True)
@@ -257,6 +319,8 @@ class Interpretation:
     spec: PlaylistSpec | None
     error: str | None
     raw: dict[str, Any]
+    unsupported: tuple[str, ...] = ()  # parts of the request the spec does not capture
+    notes: tuple[str, ...] = ()        # how the request was read where that was not literal
 
 
 def interpret_request(text: str, client: LLMClient, today: date) -> Interpretation:
@@ -269,12 +333,111 @@ def interpret_request(text: str, client: LLMClient, today: date) -> Interpretati
     if not isinstance(data, dict):
         return Interpretation(None, "the request could not be interpreted as a playlist", raw)
     data = {k: v for k, v in data.items() if v is not None}
-    if isinstance(data.get("bpm"), dict):
-        data["bpm"] = {k: v for k, v in data["bpm"].items() if v is not None}
+    for nested in ("bpm", "ordering"):
+        if isinstance(data.get(nested), dict):
+            data[nested] = {k: v for k, v in data[nested].items() if v is not None}
+    unsupported = tuple(str(u).strip() for u in raw.get("unsupported") or [] if str(u).strip())
     try:
-        return Interpretation(parse_spec(data), None, raw)
+        spec = parse_spec(data)
+    except SpecError:
+        spec = None
+    notes: tuple[str, ...] = ()
+    if spec is None or not _satisfiable(spec):
+        # "Under 90 and above 150 BPM": ranges no track can meet together mean either/or.
+        merged = _ranges_as_alternatives(data)
+        if merged is not None:
+            try:
+                spec = parse_spec(merged)
+                notes = tuple(f"ranges that can't hold together read as either/or: "
+                              f"{describe_group(g)}" for g in spec.filters if len(g) > 1)
+            except SpecError:
+                pass
+    try:
+        spec = spec or parse_spec(data)
     except SpecError as exc:
-        return Interpretation(None, f"the request is invalid or contradictory: {exc}", raw)
+        return Interpretation(None, f"the request is invalid or contradictory: {exc}", raw,
+                              unsupported)
+    return Interpretation(spec, None, raw, unsupported, notes)
+
+
+_RANGE_OPS = {"lt", "le", "gt", "ge", "between", "eq"}
+
+
+def _interval(c: dict[str, Any]) -> tuple[Any, Any] | None:
+    """(low, high) of a numeric/date condition; None for other conditions."""
+    if c.get("negate") or c.get("op") not in _RANGE_OPS or not c.get("values"):
+        return None
+    v = c["values"]
+    try:
+        if c["field"] == "added":
+            v = [date.fromisoformat(str(x)) for x in v]
+        elif c["field"] in ("bpm", "year", "duration_minutes", "loudness_lufs"):
+            v = [float(x) for x in v]
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+    lo, hi = (None, None)
+    if c["op"] in ("lt", "le"):
+        hi = v[0]
+    elif c["op"] in ("gt", "ge"):
+        lo = v[0]
+    elif c["op"] == "eq" or len(v) == 2:
+        lo, hi = min(v[0], v[-1]), max(v[0], v[-1])
+    return lo, hi
+
+
+def _disjoint(intervals: list[tuple[Any, Any]]) -> bool:
+    lows = [lo for lo, _ in intervals if lo is not None]
+    highs = [hi for _, hi in intervals if hi is not None]
+    return bool(lows and highs) and max(lows) >= min(highs)
+
+
+def _ranges_as_alternatives(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Merge single-condition groups on one field that can't hold together into one group.
+
+    A simple BPM range with its minimum above its maximum counts too. Returns the
+    changed data, or None if there is nothing to merge.
+    """
+    groups = [list(g) for g in data.get("filters") or []]
+    bpm = data.get("bpm") or {}
+    lo, hi = bpm.get("min"), bpm.get("max")
+    out = dict(data)
+    if lo is not None and hi is not None and lo > hi:
+        out.pop("bpm")
+        groups.append([{"field": "bpm", "op": "le", "values": [hi], "negate": False},
+                       {"field": "bpm", "op": "ge", "values": [lo], "negate": False}])
+    elif bpm and any(len(g) == 1 and g[0].get("field") == "bpm" for g in groups):
+        out.pop("bpm")  # take part in the comparison below
+        for op, v in (("ge", lo), ("le", hi)):
+            if v is not None:
+                groups.append([{"field": "bpm", "op": op, "values": [v], "negate": False}])
+    by_field: dict[str, list[int]] = {}
+    for i, g in enumerate(groups):
+        if len(g) == 1 and _interval(g[0]) is not None:
+            by_field.setdefault(g[0]["field"], []).append(i)
+    merged_any = len(groups) != len(data.get("filters") or [])
+    drop: set[int] = set()
+    for idx in by_field.values():
+        if len(idx) > 1 and _disjoint([_interval(groups[i][0]) for i in idx]):  # type: ignore[misc]
+            groups[idx[0]] = [groups[i][0] for i in idx]
+            drop |= set(idx[1:])
+            merged_any = True
+    if not merged_any:
+        return None
+    out["filters"] = [g for i, g in enumerate(groups) if i not in drop]
+    return out
+
+
+def _satisfiable(spec: PlaylistSpec) -> bool:
+    """False if single-condition range groups on one field can't all hold."""
+    by_field: dict[str, list[tuple[Any, Any]]] = {}
+    for g in spec.filters:
+        if len(g) == 1 and (iv := _interval(g[0].model_dump(mode="json"))) is not None:
+            by_field.setdefault(g[0].field, []).append(iv)
+    if spec.bpm is not None:
+        by_field.setdefault("bpm", []).append((spec.bpm.min, spec.bpm.max))
+    return not any(len(ivs) > 1 and _disjoint(ivs) for ivs in by_field.values())
 
 
 # --------------------------------------------------------------------------- refinement
@@ -340,6 +503,8 @@ def refine_playlist(result: BuildResult, pool: list[Track], client: LLMClient,
     """
     if not result.tracks:
         return Refinement(False, result, "nothing to refine")
+    if result.spec.selection == "all":
+        return Refinement(False, result, "not available for a list of all matching tracks")
     spec = result.spec
     candidates = shortlist(result, pool)
     by_id = {t.id: t for t in candidates}

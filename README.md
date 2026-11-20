@@ -36,11 +36,22 @@ BPM, keys, genres and durations are sent — never file paths or audio.
 ### How a request becomes a playlist
 
 1. **Interpretation** (`llm.py`, `spec.py`): the LLM returns JSON constrained by a
-   schema, which is validated again as a `PlaylistSpec`. Contradictory requests
-   (e.g. min BPM above max) are reported, never silently changed.
+   schema, which is validated again as a `PlaylistSpec`. The report starts with
+   the interpretation in plain words (`Constraints:` / `Preferences:`), so a
+   misreading is visible at once. Parts of a request that can't be expressed are
+   listed as "not understood, ignored" instead of failing the whole request.
    *Hard constraints*: genre, filesystem-creation date, BPM limits, folder,
-   artists, track count, total duration. *Soft preferences*: BPM progression,
-   harmonic compatibility.
+   artists, track count, total duration, free-form filters, and a maximum BPM
+   step between neighbours. *Soft preferences*: BPM progression, harmonic
+   compatibility.
+   *Selection*: a set of some length (the default), or every matching track
+   ("all the tracks from 2026", "list every track under 90 BPM").
+   *Filters* combine conditions with and/or/not on BPM, release year, track
+   length, loudness, date added, genre, artist, title, album, format, folder,
+   Camelot key, and whether key/BPM are certain: "under 90 or above 150 BPM",
+   "in 8A or 9A but not techno", "only tracks with a certain key". Ranges that
+   can't hold together ("under 90 *and* above 150") are read as either/or, and
+   the report says so.
 2. **Retrieval** (`query.py`): parameterized SQLite filters on the effective
    (reconciled) values. A track with missing data never satisfies a constraint
    on that field; BPMs where tags and analysis CONFLICT (and no manual value
@@ -48,7 +59,11 @@ BPM, keys, genres and durations are sent — never file paths or audio.
    number of tracks excluded for each reason is reported.
 3. **Building** (`builder.py`): a deterministic greedy sequencer, run from several
    starting tracks, picks each next track by transition score while keeping
-   count/duration satisfiable. Tempo follows a planned ramp for ascending or
+   count/duration satisfiable. A maximum BPM step ("no more than 2 BPM from track
+   to track") is never broken: with a progression no step goes against it either,
+   so the playlist may come out shorter than asked (reported as `UNMET`). A list
+   of all matching tracks with a progression is sorted by tempo; with a step rule
+   it keeps the longest run without a larger gap and reports what was left out. Tempo follows a planned ramp for ascending or
    descending requests; Camelot-wheel neighbours score high; missing or
    unreliable keys get a neutral score; duplicate songs are skipped. The result
    is validated against every hard constraint.
@@ -101,6 +116,11 @@ Commands at the prompt (anything else is a natural-language request):
 | `help` | show commands |
 
 Track IDs are the library's IDs (see `hades search`); positions start at 1.
+
+From the command line, `hades from 55 475 1 789` makes a playlist of exactly these
+tracks from lowest to highest BPM; add `-k` for the smoothest harmonic order
+(exhaustive up to 12 tracks) and `-n NAME` to save it. Such playlists can't be
+run `again` or refined: there is no request behind them.
 Manual edits may break the original request; the Notes column and the status
 line show what no longer holds. Replacing a playlist that has unsaved changes (with a
 new request, `again`, `open` or `new`) asks first: press Enter a second time to

@@ -44,15 +44,18 @@ def generate(conn: sqlite3.Connection, request: str, client: LLMClient,
     gen.spec = interpretation.spec
     gen.pool = find_candidates(conn, gen.spec)
     gen.result = build_playlist(gen.spec, gen.pool)
+    gen.result.warnings[:0] = [f"not understood, ignored: “{u}”"
+                               for u in interpretation.unsupported] + list(interpretation.notes)
     return gen
 
 
 def generate_again(conn: sqlite3.Connection, playlist: Playlist,
                    seed: int | None = None) -> BuildResult:
     """Rebuild a generated playlist's request (no LLM call), preferring other tracks."""
-    if playlist.spec is None:
+    if not playlist.generated:
         raise ValueError("this playlist was not generated from a request, so there is "
                          "nothing to run again")
+    assert playlist.spec is not None
     pool = find_candidates(conn, playlist.spec)
     seed = random.randrange(2**31) if seed is None else seed
     return build_variation(playlist.spec, pool, [t.id for t in playlist.tracks], seed)
