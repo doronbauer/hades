@@ -20,6 +20,7 @@ class Command:
     action: str                 # name | rename | move | remove | add | save | playlists | open | ...
     text: str | None = None     # name or path argument
     track_id: int | None = None
+    track_ids: tuple[int, ...] = ()     # remove / add: one or more IDs
     position: int | None = None
 
 
@@ -27,8 +28,9 @@ USAGE = {
     "name": "name <playlist name>",
     "rename": "rename <new name>",
     "move": "move <track ID> to <position>",
-    "remove": "remove <track ID>",
-    "add": "add <track ID> [at <position>]",
+    "remove": "remove <track ID> [<track ID> ...]",
+    "add": "add <track ID> [<track ID> ...] [at <position>]",
+    "keep": "keep (remove all tracks that are not marked)",
     "save": "save",
     "playlists": "playlists",
     "open": "open <playlist name>",
@@ -40,11 +42,11 @@ USAGE = {
 }
 
 _ALIASES = {"rm": "remove", "delete": "remove", "ls": "playlists", "load": "open", "?": "help",
-            "regenerate": "again", "retry": "again"}
+            "regenerate": "again", "retry": "again", "prune": "keep"}
 
 _MOVE = re.compile(r"(\d+)\s+(?:to\s+)?(\d+)", re.IGNORECASE)
-_ADD = re.compile(r"(\d+)(?:\s+(?:at\s+)?(\d+))?", re.IGNORECASE)
-_ID = re.compile(r"(\d+)")
+_IDS = re.compile(r"\d+(?:\s+\d+)*")
+_ADD = re.compile(r"(\d+(?:\s+\d+)*)(?:\s+at\s+(\d+))?", re.IGNORECASE)
 
 
 def parse_command(text: str) -> Command | None:
@@ -66,7 +68,7 @@ def parse_command(text: str) -> Command | None:
         return Command(action, text=rest)
     if action == "export":
         return Command(action, text=rest or None)
-    if action in ("save", "playlists", "again", "refine", "new", "help"):
+    if action in ("save", "playlists", "again", "refine", "new", "keep", "help"):
         if rest:
             raise fail()
         return Command(action)
@@ -75,14 +77,18 @@ def parse_command(text: str) -> Command | None:
             raise fail()
         return Command(action, track_id=int(m[1]), position=int(m[2]))
     if action == "remove":
-        if not (m := _ID.fullmatch(rest)):
+        if not _IDS.fullmatch(rest):
             raise fail()
-        return Command(action, track_id=int(m[1]))
+        return Command(action, track_ids=_ids(rest))
     if action == "add":
         if not (m := _ADD.fullmatch(rest)):
             raise fail()
-        return Command(action, track_id=int(m[1]), position=int(m[2]) if m[2] else None)
+        return Command(action, track_ids=_ids(m[1]), position=int(m[2]) if m[2] else None)
     raise AssertionError(action)
+
+
+def _ids(text: str) -> tuple[int, ...]:
+    return tuple(int(n) for n in text.split())
 
 
 HELP_TEXT = "Commands: " + " · ".join(USAGE.values()) + \

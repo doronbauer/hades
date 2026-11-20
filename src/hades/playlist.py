@@ -38,6 +38,7 @@ class Playlist:
     named: bool = False                    # the user has assigned a name
     dirty: bool = False                    # unsaved changes
     saved_name: str | None = None          # name in the database at the last save/load
+    marked: set[int] = field(default_factory=set)  # track IDs picked in the UI (not saved)
 
     @classmethod
     def from_result(cls, result: BuildResult, prompt: str | None) -> Playlist:
@@ -102,7 +103,28 @@ class Playlist:
     def remove(self, track_id: int) -> Track:
         current = self._require(track_id)
         self.dirty = True
+        self.marked.discard(track_id)
         return self.entries.pop(current - 1).track
+
+    def toggle_mark(self, track_id: int) -> bool:
+        """Mark or unmark a track; return whether it is marked now."""
+        self._require(track_id)
+        if track_id in self.marked:
+            self.marked.discard(track_id)
+            return False
+        self.marked.add(track_id)
+        return True
+
+    def keep_marked(self) -> list[Track]:
+        """Remove every track that is not marked, clear the marks, return the removed."""
+        keep = self.marked & {t.id for t in self.tracks}
+        if not keep:
+            raise EditError("no tracks are marked (select a row and press C to mark it)")
+        removed = [e.track for e in self.entries if e.track.id not in keep]
+        self.entries = [e for e in self.entries if e.track.id in keep]
+        self.marked.clear()
+        self.dirty = self.dirty or bool(removed)
+        return removed
 
     def add(self, track: Track, position: int | None = None) -> int:
         """Insert (default: append) and return the 1-based position used."""

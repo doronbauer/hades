@@ -39,10 +39,14 @@ def make(tracks, n: int = 4) -> Playlist:
     ("rename  New Name ", Command("rename", text="New Name")),
     ("move 876 to 4", Command("move", track_id=876, position=4)),
     ("MOVE 876 4", Command("move", track_id=876, position=4)),
-    ("remove 876", Command("remove", track_id=876)),
-    ("rm 876", Command("remove", track_id=876)),
-    ("add 1042", Command("add", track_id=1042)),
-    ("add 1042 at 3", Command("add", track_id=1042, position=3)),
+    ("remove 876", Command("remove", track_ids=(876,))),
+    ("rm 876", Command("remove", track_ids=(876,))),
+    ("remove 45 7  879", Command("remove", track_ids=(45, 7, 879))),
+    ("add 1042", Command("add", track_ids=(1042,))),
+    ("add 1042 at 3", Command("add", track_ids=(1042,), position=3)),
+    ("add 1042 7 AT 3", Command("add", track_ids=(1042, 7), position=3)),
+    ("add 1042 7", Command("add", track_ids=(1042, 7))),
+    ("keep", Command("keep")),
     ("save", Command("save")),
     ("playlists", Command("playlists")),
     ("open My Playlist", Command("open", text="My Playlist")),
@@ -54,13 +58,35 @@ def test_parse_command(text: str, expected: Command | None) -> None:
 
 
 @pytest.mark.parametrize("text", ["move 876", "move abc to 2", "remove", "add x", "name",
-                                  "save now"])
+                                  "save now", "remove 4 x", "add 4 at", "keep 4"])
 def test_bad_command_arguments(text: str) -> None:
     with pytest.raises(CommandError, match="usage:"):
         parse_command(text)
 
 
 # --------------------------------------------------------------------------- editing
+
+
+def test_mark_and_keep(tracks) -> None:
+    pl = make(tracks)
+    a, b, c, d = (t.id for t in pl.tracks)
+    with pytest.raises(EditError, match="no tracks are marked"):
+        pl.keep_marked()
+    assert pl.toggle_mark(a) and pl.toggle_mark(c) and pl.toggle_mark(d)
+    assert not pl.toggle_mark(d)  # a second press unmarks
+    with pytest.raises(EditError):
+        pl.toggle_mark(999999)
+    removed = pl.keep_marked()
+    assert [t.id for t in removed] == [b, d]
+    assert [t.id for t in pl.tracks] == [a, c] and pl.marked == set()
+
+
+def test_remove_unmarks(tracks) -> None:
+    pl = make(tracks)
+    first = pl.tracks[0].id
+    pl.toggle_mark(first)
+    pl.remove(first)
+    assert pl.marked == set()
 
 
 def test_new_playlist_is_untitled(tracks) -> None:

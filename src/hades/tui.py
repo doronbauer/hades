@@ -40,7 +40,7 @@ from hades.service import (
 FIXED_COLUMNS = (("#", 5), ("ID", 6), ("BPM", 5), ("Key", 4), ("Time", 7), ("Added", 10),
                  ("Notes", 26))
 COLUMNS = ("#", "ID", "Artist — Title", "BPM", "Key", "Time", "Added", "Notes")
-HELP_KEYS = ("↑↓ Navigate & play   Space Pause/resume   M Preview mode   "
+HELP_KEYS = ("↑↓ Navigate & play   Space Pause/resume   M Preview mode   C Mark/unmark   "
              "Tab Switch focus   Enter Submit   Ctrl+Q Quit   (type `help` for commands)")
 
 
@@ -50,6 +50,7 @@ class PlaylistTable(DataTable):
     BINDINGS = [
         Binding("space", "app.toggle_pause", "Pause"),
         Binding("m", "app.toggle_mode", "Preview mode"),
+        Binding("c", "app.toggle_mark", "Mark"),
     ]
 
     class Navigated(Message):
@@ -161,13 +162,14 @@ class HadesApp(App[None]):
             elif not t.available:
                 notes.append("file unavailable")
             marker = "▶" if t.id == self.playing_id else " "
+            mark = ("●", "bold magenta") if t.id in pl.marked else (" ", "")
             bpm = "–" if t.bpm is None else f"{t.bpm:.0f}" + ("" if t.bpm_reliable else "?")
             key = "–" if t.camelot is None else t.camelot + ("" if t.key_reliable else "?")
             time = fmt_duration(t.duration) if t.duration else "–"
             added = t.created_date.isoformat() if t.created_date else "–"
             style = "bold green" if t.id == self.playing_id else ("red" if not t.available else "")
             table.add_row(
-                Text(f"{marker}{pos}", style=style), str(t.id), _fit(t.display, title_w, style),
+                Text.assemble((marker, style), mark, (str(pos), style)), str(t.id), _fit(t.display, title_w, style),
                 bpm, key, time, added, _fit(", ".join(notes), 26, "yellow"), key=str(t.id))
         if pl.entries:
             row = (pl.position_of(focus_track) or 1) - 1 if focus_track is not None \
@@ -178,6 +180,8 @@ class HadesApp(App[None]):
         stats = f"{s.count} tracks | {fmt_duration(s.total_seconds)} total | {s.bpm_range}"
         if s.unknown_duration:
             stats += f" | {s.unknown_duration} with unknown length"
+        if marked := len(pl.marked & {t.id for t in pl.tracks}):
+            stats += f" | {marked} marked (`keep` removes the rest)"
         if pl.prompt:
             stats += f" | “{pl.prompt}”"
         text = Text(stats)
@@ -247,6 +251,13 @@ class HadesApp(App[None]):
         # Affects the next selection only; the current track keeps playing.
         self.mode = "MIDDLE" if self.mode == "START" else "START"
         self._render_player()
+
+    def action_toggle_mark(self) -> None:
+        table = self.query_one(PlaylistTable)
+        if not 0 <= table.cursor_row < len(self.playlist):
+            return
+        self.playlist.toggle_mark(self.playlist.entries[table.cursor_row].track.id)
+        self.refresh_view()
 
     def _poll_player(self) -> None:
         if self._poll is not None and not self._poll.done():
@@ -320,17 +331,23 @@ class HadesApp(App[None]):
                 pl.move(cmd.track_id, cmd.position)  # type: ignore[arg-type]
                 self.log_line(f"Moved {cmd.track_id} to position {cmd.position}.")
             elif cmd.action == "remove":
-                track = pl.remove(cmd.track_id)  # type: ignore[arg-type]
-                self.log_line(f"Removed {track.id}: {track.display}.")
+                for track_id in cmd.track_ids:
+                    try:
+                        track = pl.remove(track_id)
+                    except EditError as exc:
+                        self.log_line(str(exc), "red")
+                    else:
+                        self.log_line(f"Removed {track.id}: {track.display}.")
             elif cmd.action == "add":
-                track = load_track(self.conn, cmd.track_id)  # type: ignore[arg-type]
-                if track is None:
-                    raise EditError(f"no track with ID {cmd.track_id} in the library")
-                pos = pl.add(track, cmd.position)
-                self.log_line(f"Added {track.id} at position {pos}: {track.display}.")
-                if not track.available:
-                    self.log_line(f"Track {track.id} is currently unavailable ({track.path}).",
-                                  "yellow")
+                position = cmd.position
+                for track_id in cmd.track_ids:
+                    try:
+                        position = self._add_track(track_id, position)
+                    except EditError as exc:
+                        self.log_line(str(exc), "red")
+            elif cmd.action == "keep":
+                removed = pl.keep_marked()
+                self.log_line(f"Kept {len(pl)} marked tracks, removed {len(removed)}.")
             elif cmd.action == "save":
                 path = save_and_export(self.conn, pl, self.export_dir, self.export_extension)
                 self.log_line(f"Saved “{pl.name}” ({len(pl)} tracks) → {path}", "green")
@@ -365,7 +382,20 @@ class HadesApp(App[None]):
                 self.log_line(HELP_TEXT)
         except (EditError, RepositoryError, ExportError) as exc:
             self.log_line(str(exc), "red")
-        self.refresh_view(focus_track=cmd.track_id if cmd.action in ("move", "add") else None)
+        focus = cmd.track_id if cmd.action == "move" else (
+            cmd.track_ids[0] if cmd.action == "add" else None)
+        self.refresh_view(focus_track=focus)
+
+    def _add_track(self, track_id: int, position: int | None) -> int | None:
+        """Add one track; return the position for the next one (None: append)."""
+        track = load_track(self.conn, track_id)
+        if track is None:
+            raise EditError(f"no track with ID {track_id} in the library")
+        pos = self.playlist.add(track, position)
+        self.log_line(f"Added {track.id} at position {pos}: {track.display}.")
+        if not track.available:
+            self.log_line(f"Track {track.id} is currently unavailable ({track.path}).", "yellow")
+        return None if position is None else pos + 1
 
     def _warn_unavailable(self) -> None:
         n = sum(1 for t in self.playlist.tracks if not t.available)

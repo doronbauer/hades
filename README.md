@@ -94,6 +94,7 @@ Interpretation rules worth knowing:
 | ↑ / ↓ | select previous/next track and play it (playlist focused) |
 | Space | pause/resume |
 | M | toggle preview mode START (from 0:00) / MIDDLE (from 50%) for the next selection |
+| C | mark / unmark the selected track (● next to its number) |
 | Tab | switch focus between playlist and prompt |
 | Enter | submit the prompt |
 | Ctrl+Q | quit |
@@ -104,8 +105,9 @@ Commands at the prompt (anything else is a natural-language request):
 |---|---|
 | `name My Playlist` / `rename New Name` | set the name |
 | `move 876 to 4` | move track ID 876 to position 4 |
-| `remove 876` | remove track ID 876 |
-| `add 1042` / `add 1042 at 3` | append / insert a track by ID |
+| `remove 876` / `remove 45 7 879` | remove one or more tracks by ID |
+| `add 1042` / `add 1042 77 at 3` | append / insert one or more tracks by ID (in the given order) |
+| `keep` | remove every track that is not marked (then clears the marks) |
 | `save` | save (requires a name) and write `<export_directory>/<name>.m3u` |
 | `export` / `export ~/Desktop/set.m3u` | write the current playlist file (default: export_directory) |
 | `again` | another version of the same request (no LLM call), preferring other tracks |

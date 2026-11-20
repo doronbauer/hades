@@ -132,6 +132,16 @@ def test_generate_navigate_play_edit_save(conn, config, music_dir: Path) -> None
             await submit(pilot, app, "add 99999")
             assert "no track with ID 99999" in log_text(app)
 
+            # Several IDs at once; a bad one is reported and the rest still apply.
+            spares = [i for i in ids if app.playlist.position_of(i) is None][:2]
+            await submit(pilot, app, f"add {spares[0]} 99999 {spares[1]} at 1")
+            assert [t.id for t in app.playlist.tracks[:2]] == spares
+            assert "no track with ID 99999" in log_text(app)
+            await submit(pilot, app, f"remove {spares[0]} 99999 {spares[1]}")
+            assert all(app.playlist.position_of(i) is None for i in spares)
+            assert "track 99999 is not in the playlist" in log_text(app)
+            assert len(app.playlist) == 4
+
             await submit(pilot, app, "save")
             assert "name the playlist first" in log_text(app)
             await submit(pilot, app, "name Warmup")
@@ -157,6 +167,32 @@ def test_generate_navigate_play_edit_save(conn, config, music_dir: Path) -> None
             assert "Warmup  (4 tracks" in log_text(app)
             await submit(pilot, app, "open Warmup")
             assert [t.id for t in app.playlist.tracks] == saved
+
+    asyncio.run(scenario())
+
+
+def test_mark_and_keep(conn, config, music_dir: Path) -> None:
+    ids = [insert_track(conn, music_dir, artist=f"A{i}") for i in range(4)]
+
+    async def scenario() -> None:
+        app = make_app(conn, config, FakeLLM(), FakePlayer())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(pilot, app, "add " + " ".join(map(str, ids)))
+            assert [t.id for t in app.playlist.tracks] == ids
+            await submit(pilot, app, "keep")
+            assert "no tracks are marked" in log_text(app) and len(app.playlist) == 4
+
+            table = app.query_one(PlaylistTable)
+            await pilot.press("tab")
+            table.move_cursor(row=0)
+            await pilot.press("c", "down", "down", "c", "down", "c", "c")  # last one toggled off
+            assert app.playlist.marked == {ids[0], ids[2]}
+            assert "●" in str(table.get_row_at(0)[0]) and "●" not in str(table.get_row_at(1)[0])
+            assert "2 marked" in str(app.query_one("#stats").render())
+
+            await submit(pilot, app, "keep")
+            assert [t.id for t in app.playlist.tracks] == [ids[0], ids[2]]
+            assert "removed 2" in log_text(app) and app.playlist.marked == set()
 
     asyncio.run(scenario())
 
