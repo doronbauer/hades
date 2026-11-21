@@ -41,7 +41,7 @@ from hades.service import (
 FIXED_COLUMNS = (("#", 5), ("ID", 6), ("BPM", 5), ("Key", 4), ("Time", 7), ("Added", 10),
                  ("Notes", 26))
 COLUMNS = ("#", "ID", "Artist — Title", "BPM", "Key", "Time", "Added", "Notes")
-HELP_KEYS = ("↑↓ Navigate & play   Space Pause/resume   M Preview mode   C Mark/unmark   "
+HELP_KEYS = ("↑↓ Navigate & play   ←→ Seek 10%   Space Pause/resume   M Preview mode   C Mark/unmark   "
              "G Move track   Tab Switch focus   Enter Submit   Ctrl+Q Quit   (type `help` for commands)")
 GRAB_HELP = "MOVING ⇅   ↑↓ Move track   G/Enter Drop here   Esc Cancel"
 
@@ -51,6 +51,8 @@ class PlaylistTable(DataTable):
 
     BINDINGS = [
         Binding("space", "app.toggle_pause", "Pause"),
+        Binding("left", "app.seek(-1)", "Seek back", show=False),
+        Binding("right", "app.seek(1)", "Seek forward", show=False),
         Binding("m", "app.toggle_mode", "Preview mode"),
         Binding("c", "app.toggle_mark", "Mark"),
         Binding("g", "app.toggle_grab", "Move track"),
@@ -283,6 +285,15 @@ class HadesApp(App[None]):
     def action_toggle_pause(self) -> None:
         self._player_call(self.player.toggle_pause)
 
+    def action_seek(self, direction: int) -> None:
+        # Only the track under the cursor; the player ignores it once nothing is loaded.
+        table = self.query_one(PlaylistTable)
+        if self.playing_id is None or not 0 <= table.cursor_row < len(self.playlist) \
+                or self.playlist.entries[table.cursor_row].track.id != self.playing_id:
+            return
+        self._player_call(self.player.seek_step, direction)
+        self._poll_player()  # show the new position without waiting for the next tick
+
     def action_toggle_mode(self) -> None:
         # Affects the next selection only; the current track keeps playing.
         self.mode = "MIDDLE" if self.mode == "START" else "START"
@@ -367,10 +378,26 @@ class HadesApp(App[None]):
             self._seen_playing = True
             self._last_playback_error = None
         elif self.playing_id is not None and self._seen_playing:
-            self.playing_id = None  # the track ended; playback stops (no auto-advance)
-            self.refresh_view()
+            self._advance()
             return
         self._render_player()
+
+    def _advance(self) -> None:
+        """The playing track ended: play the next available one, or stop after the last."""
+        pos = self.playlist.position_of(self.playing_id) if self.playing_id is not None else None
+        self.playing_id = None
+        # pos is 1-based, so range(pos, ...) starts at the row after the ended track.
+        row = next((r for r in range(pos, len(self.playlist))
+                    if self.playlist.entries[r].track.available), None) if pos else None
+        if pos is None or row is None:
+            self.refresh_view()
+            return
+        if skipped := row - pos:
+            self.log_line(f"Skipped {skipped} unavailable track{'s' if skipped > 1 else ''}.",
+                          "yellow")
+        if self._grab is None:  # while moving a track the cursor stays on it
+            self.query_one(PlaylistTable).move_cursor(row=row)
+        self.play_row(row)
 
     # ------------------------------------------------------------------ prompt
 

@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from hades.player import MpvPlayer, NullPlayer, PlayerError, make_player
+import hades.player
+from hades.player import MpvPlayer, NullPlayer, PlayerError, make_player, snap_target
 
 FAKE_MPV = r'''#!{python}
 import json, os, socket, sys
@@ -45,6 +46,8 @@ for line in f:
         state["idle-active"] = True
     elif cmd[0] == "cycle":
         state["pause"] = not state["pause"]
+    elif cmd[0] == "seek":
+        pass  # like a real seek still in progress: time-pos keeps its old value
     f.write(json.dumps(out).encode() + b"\n")
     f.flush()
 '''
@@ -121,3 +124,61 @@ def test_backend_unavailable(tmp_path: Path) -> None:
     with pytest.raises(PlayerError, match="mpv not found"):
         p.play(audio(tmp_path), "START")
     assert not p.state().playing
+
+
+@pytest.mark.parametrize(("position", "direction", "expected"), [
+    (0.0, 1, 30.0), (12.5, 1, 30.0), (150.0, 1, 180.0), (159.0, 1, 180.0),
+    (179.6, 1, 210.0), (179.4, 1, 180.0),  # mpv reads a bit low right after a seek
+    (269.0, 1, 270.0), (270.0, 1, None), (295.0, 1, None),
+    (189.0, -1, 180.0), (182.0, -1, 180.0),
+    (180.0, -1, 150.0), (181.0, -1, 150.0),  # just jumped there: skip it
+    (20.0, -1, 0.0), (1.0, -1, 0.0), (0.0, -1, None),
+])
+def test_snap_target(position: float, direction: int, expected: float | None) -> None:
+    target = snap_target(position, 300.0, direction)
+    assert target is None if expected is None else target == pytest.approx(expected)
+
+
+def test_snap_target_unknown_length() -> None:
+    assert snap_target(10.0, None, 1) is None and snap_target(10.0, 0.0, -1) is None
+    assert snap_target(None, 300.0, 1) is None
+
+
+def seeks(log: Path) -> list[float]:
+    return [c[1] for c in commands(log) if c[0] == "seek"]
+
+
+def test_repeated_seeks_step_from_the_last_target(player, fake_mpv, tmp_path: Path) -> None:
+    player.play(audio(tmp_path), "START")  # fake mpv reports 12.5 of 300 throughout
+    for _ in range(3):
+        player.seek_step(1)
+    player.seek_step(-1)
+    assert seeks(fake_mpv[1]) == pytest.approx([30.0, 60.0, 90.0, 60.0])
+    assert all(c[2] == "absolute+exact" for c in commands(fake_mpv[1]) if c[0] == "seek")
+
+
+def test_seek_uses_the_position_once_settled(player, fake_mpv, tmp_path: Path,
+                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hades.player, "SEEK_SETTLE", 0.0)
+    player.play(audio(tmp_path), "START")
+    player.seek_step(1)
+    player.seek_step(1)
+    assert seeks(fake_mpv[1]) == pytest.approx([30.0, 30.0])
+
+
+def test_new_track_forgets_the_last_seek(player, fake_mpv, tmp_path: Path) -> None:
+    player.play(audio(tmp_path), "START")
+    player.seek_step(1)
+    player.seek_step(1)
+    player.play(audio(tmp_path), "START")
+    player.seek_step(1)
+    assert seeks(fake_mpv[1]) == pytest.approx([30.0, 60.0, 30.0])
+
+
+def test_seek_when_idle_does_nothing(player, fake_mpv, tmp_path: Path) -> None:
+    player.seek_step(1)  # never started
+    player.play(audio(tmp_path), "START")
+    player.stop()
+    player.seek_step(1)
+    assert seeks(fake_mpv[1]) == []
+    NullPlayer("no backend").seek_step(1)

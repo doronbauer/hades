@@ -91,7 +91,8 @@ Interpretation rules worth knowing:
 
 | Key | Action |
 |---|---|
-| ↑ / ↓ | select previous/next track and play it (playlist focused) |
+| ↑ / ↓ | select previous/next track and play it (playlist focused); when a track ends the next one plays, skipping unavailable files, and playback stops after the last |
+| ← / → | jump the playing track to the previous / next 10% point (← in the first 10% goes to 0:00; → does nothing in the last 10%) |
 | Space | pause/resume |
 | M | toggle preview mode START (from 0:00) / MIDDLE (from 50%) for the next selection |
 | C | mark / unmark the selected track (● next to its number) |

@@ -30,6 +30,10 @@ class FakePlayer:
             self.calls.append(("toggle_pause",))
             self.paused = not self.paused
 
+    def seek_step(self, direction: int) -> None:
+        with self.lock:
+            self.calls.append(("seek_step", direction))
+
     def stop(self) -> None:
         with self.lock:
             self.calls.append(("stop",))
@@ -44,6 +48,11 @@ class FakePlayer:
 
     def close(self) -> None:
         pass
+
+    def finish(self) -> None:
+        """The current track plays to its end."""
+        with self.lock:
+            self.current = None
 
     def actions(self) -> list[tuple]:
         with self.lock:
@@ -230,6 +239,67 @@ def test_grab_and_move_tracks(conn, config, music_dir: Path) -> None:
             await pilot.press("g", "down", "tab")  # leaving the table drops the track
             assert [t.id for t in app.playlist.tracks] == [ids[1], ids[2], ids[0], ids[3]]
             assert app._grab is None and not table.moving
+
+    asyncio.run(scenario())
+
+
+def test_arrows_seek_the_playing_track(conn, config, music_dir: Path) -> None:
+    ids = [insert_track(conn, music_dir, artist=f"A{i}") for i in range(3)]
+
+    async def scenario() -> None:
+        player = FakePlayer()
+        app = make_app(conn, config, FakeLLM(), player)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(pilot, app, "add " + " ".join(map(str, ids)))
+            await pilot.press("left", "right")  # in the prompt: text editing only
+            await pilot.press("tab", "right")  # in the table, but nothing playing yet
+            await pilot.pause(0.1)
+            assert player.actions() == []
+
+            await pilot.press("down")
+            await pilot.press("right", "right", "right", "left")
+            await until(pilot, lambda: len(player.actions()) == 5)
+            assert player.actions()[1:] == [("seek_step", 1)] * 3 + [("seek_step", -1)]
+
+            app.query_one(PlaylistTable).move_cursor(row=2)  # cursor off the playing track
+            await pilot.press("right")
+            await pilot.pause(0.1)
+            assert len(player.actions()) == 5
+
+    asyncio.run(scenario())
+
+
+def test_auto_advance(conn, config, music_dir: Path) -> None:
+    ids = [insert_track(conn, music_dir, artist="A0"),
+           insert_track(conn, music_dir, artist="A1", create_file=False),
+           insert_track(conn, music_dir, artist="A2"),
+           insert_track(conn, music_dir, artist="A3")]
+
+    async def scenario() -> None:
+        player = FakePlayer()
+        app = make_app(conn, config, FakeLLM(), player)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(pilot, app, "add " + " ".join(map(str, ids)))
+            table = app.query_one(PlaylistTable)
+            await pilot.press("tab")
+            table.move_cursor(row=0)
+            app.play_row(0)
+            await until(pilot, lambda: app.player_state.playing)
+
+            player.finish()  # skips the unavailable track
+            await until(pilot, lambda: app.playing_id == ids[2])
+            assert table.cursor_row == 2 and "Skipped 1 unavailable track." in log_text(app)
+            await until(pilot, lambda: app.player_state.playing)
+
+            player.finish()
+            await until(pilot, lambda: app.playing_id == ids[3])
+            await until(pilot, lambda: app.player_state.playing)
+            player.finish()  # the last one: playback stops
+            await until(pilot, lambda: app.playing_id is None)
+            await pilot.pause(0.6)
+            plays = [a[1] for a in player.actions() if a[0] == "play"]
+            assert plays == [app.playlist.entries[r].track.path for r in (0, 2, 3)]
+            assert table.cursor_row == 3
 
     asyncio.run(scenario())
 

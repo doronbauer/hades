@@ -8,6 +8,7 @@ socket, bounded timeouts); the UI runs them off its event loop.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import socket
@@ -21,6 +22,11 @@ from typing import Any, Literal, Protocol
 PreviewMode = Literal["START", "MIDDLE"]
 IPC_TIMEOUT = 1.0
 STARTUP_TIMEOUT = 5.0
+SEEK_STEPS = 10        # snap points every 10% of the track
+SEEK_GRACE = 1.5       # ← skips a snap point less than this many seconds behind
+SEEK_SETTLE = 0.5      # presses this soon after a seek start from its target
+SEEK_SLACK = 0.5       # → treats a position this close below a snap point as on it
+                       # (mpv reads ~0.25s low right after a start or seek)
 
 
 class PlayerError(Exception):
@@ -40,6 +46,7 @@ class PlayerState:
 class Player(Protocol):
     def play(self, path: str, mode: PreviewMode) -> None: ...
     def toggle_pause(self) -> None: ...
+    def seek_step(self, direction: int) -> None: ...
     def stop(self) -> None: ...
     def state(self) -> PlayerState: ...
     def close(self) -> None: ...
@@ -57,6 +64,9 @@ class NullPlayer:
     def toggle_pause(self) -> None:
         pass
 
+    def seek_step(self, direction: int) -> None:
+        pass
+
     def stop(self) -> None:
         pass
 
@@ -70,6 +80,26 @@ class NullPlayer:
 def start_offset(mode: PreviewMode) -> str:
     """mpv --start value: the beginning, or half of the file's duration."""
     return "50%" if mode == "MIDDLE" else "0"
+
+
+def snap_target(position: float | None, duration: float | None, direction: int) -> float | None:
+    """The next (direction > 0) or previous snap point at every 10% of the track.
+
+    None when there is nowhere to go: unknown length, already at the start, or in
+    the last 10% going forward (the next point would be the end of the track).
+    Going back skips points within SEEK_GRACE seconds, so a second ← right after
+    a jump doesn't land on the same point.
+    """
+    if position is None or not duration or duration <= 0:
+        return None
+    step = duration / SEEK_STEPS
+    if direction > 0:
+        index = math.floor((position + SEEK_SLACK) / step) + 1
+        return index * step if index < SEEK_STEPS else None
+    if position <= 0:
+        return None
+    index = math.ceil((position - SEEK_GRACE) / step) - 1
+    return max(0, index) * step
 
 
 class MpvPlayer:
@@ -86,6 +116,7 @@ class MpvPlayer:
         self._lock = threading.Lock()
         self._path: str | None = None
         self._error: str | None = None
+        self._last_seek: tuple[float, float] | None = None  # target, monotonic time sent
 
     # ------------------------------------------------------------------ process / IPC
 
@@ -175,6 +206,7 @@ class MpvPlayer:
             raise PlayerError(f"file not readable: {path}")
         self._error = None
         self._path = path
+        self._last_seek = None
         self._command("set_property", "start", start_offset(mode))
         self._command("loadfile", path, "replace")
         self._command("set_property", "pause", False)
@@ -182,6 +214,18 @@ class MpvPlayer:
     def toggle_pause(self) -> None:
         if self._get("idle-active") is False:
             self._command("cycle", "pause")
+
+    def seek_step(self, direction: int) -> None:
+        if self._sock is None or self._get("idle-active") is not False:
+            return
+        position = self._get("time-pos")
+        if self._last_seek is not None and time.monotonic() - self._last_seek[1] < SEEK_SETTLE:
+            position = self._last_seek[0]  # mpv may still report where it was before
+        target = snap_target(position, self._get("duration"), direction)
+        if target is None:
+            return
+        self._command("seek", target, "absolute+exact")
+        self._last_seek = (target, time.monotonic())
 
     def stop(self) -> None:
         if self._sock is not None:
