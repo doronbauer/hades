@@ -197,6 +197,43 @@ def test_mark_and_keep(conn, config, music_dir: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_grab_and_move_tracks(conn, config, music_dir: Path) -> None:
+    ids = [insert_track(conn, music_dir, artist=f"A{i}") for i in range(4)]
+
+    async def scenario() -> None:
+        player = FakePlayer()
+        app = make_app(conn, config, FakeLLM(), player)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await submit(pilot, app, "add " + " ".join(map(str, ids)))
+            app.playlist.dirty = False
+            table = app.query_one(PlaylistTable)
+            await pilot.press("tab")
+            table.move_cursor(row=1)
+
+            await pilot.press("g")
+            assert "MOVING" in str(app.query_one("#help").render())
+            assert "⇅" in str(table.get_row_at(1)[0])
+            await pilot.press("down", "down", "down")  # the last press hits the bottom
+            assert [t.id for t in app.playlist.tracks] == [ids[0], ids[2], ids[3], ids[1]]
+            assert table.cursor_row == 3
+            await pilot.press("escape")  # cancel: back to where it was, not dirty
+            assert [t.id for t in app.playlist.tracks] == ids and not app.playlist.dirty
+            assert table.cursor_row == 1 and "MOVING" not in str(app.query_one("#help").render())
+
+            await pilot.press("g", "up", "up", "enter")  # drop at the top
+            assert [t.id for t in app.playlist.tracks] == [ids[1], ids[0], ids[2], ids[3]]
+            assert app.playlist.dirty and f"Moved {ids[1]} to position 1." in log_text(app)
+            await pilot.press("down")  # plain navigation again
+            assert table.cursor_row == 1
+            await until(pilot, lambda: len(player.actions()) == 1)  # only that press played
+
+            await pilot.press("g", "down", "tab")  # leaving the table drops the track
+            assert [t.id for t in app.playlist.tracks] == [ids[1], ids[2], ids[0], ids[3]]
+            assert app._grab is None and not table.moving
+
+    asyncio.run(scenario())
+
+
 def test_unsaved_changes_need_confirmation(conn, config, music_dir: Path) -> None:
     ids = [insert_track(conn, music_dir, artist=f"A{i}") for i in range(3)]
 

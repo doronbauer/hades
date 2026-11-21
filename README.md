@@ -95,6 +95,7 @@ Interpretation rules worth knowing:
 | Space | pause/resume |
 | M | toggle preview mode START (from 0:00) / MIDDLE (from 50%) for the next selection |
 | C | mark / unmark the selected track (● next to its number) |
+| G | grab the selected track (⇅): ↑ / ↓ then move it without playing; G or Enter drops it, Esc puts it back |
 | Tab | switch focus between playlist and prompt |
 | Enter | submit the prompt |
 | Ctrl+Q | quit |

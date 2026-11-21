@@ -15,6 +15,7 @@ from typing import Any
 
 from rich.text import Text
 from textual import work
+from textual.actions import SkipAction
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.message import Message
@@ -41,7 +42,8 @@ FIXED_COLUMNS = (("#", 5), ("ID", 6), ("BPM", 5), ("Key", 4), ("Time", 7), ("Add
                  ("Notes", 26))
 COLUMNS = ("#", "ID", "Artist — Title", "BPM", "Key", "Time", "Added", "Notes")
 HELP_KEYS = ("↑↓ Navigate & play   Space Pause/resume   M Preview mode   C Mark/unmark   "
-             "Tab Switch focus   Enter Submit   Ctrl+Q Quit   (type `help` for commands)")
+             "G Move track   Tab Switch focus   Enter Submit   Ctrl+Q Quit   (type `help` for commands)")
+GRAB_HELP = "MOVING ⇅   ↑↓ Move track   G/Enter Drop here   Esc Cancel"
 
 
 class PlaylistTable(DataTable):
@@ -51,12 +53,26 @@ class PlaylistTable(DataTable):
         Binding("space", "app.toggle_pause", "Pause"),
         Binding("m", "app.toggle_mode", "Preview mode"),
         Binding("c", "app.toggle_mark", "Mark"),
+        Binding("g", "app.toggle_grab", "Move track"),
+        Binding("escape", "app.cancel_grab", "Cancel move", show=False),
     ]
+
+    moving = False  # set by the app while a track is grabbed: ↑↓ move it instead
 
     class Navigated(Message):
         def __init__(self, row: int) -> None:
             super().__init__()
             self.row = row
+
+    class Shift(Message):
+        """Move the grabbed track by `delta` positions."""
+
+        def __init__(self, delta: int) -> None:
+            super().__init__()
+            self.delta = delta
+
+    class Drop(Message):
+        """Leave the grabbed track where it is."""
 
     def _moved(self, action: Callable[[], None]) -> None:
         before = self.cursor_row
@@ -65,10 +81,26 @@ class PlaylistTable(DataTable):
             self.post_message(self.Navigated(self.cursor_row))
 
     def action_cursor_up(self) -> None:
-        self._moved(super().action_cursor_up)
+        if self.moving:
+            self.post_message(self.Shift(-1))
+        else:
+            self._moved(super().action_cursor_up)
 
     def action_cursor_down(self) -> None:
-        self._moved(super().action_cursor_down)
+        if self.moving:
+            self.post_message(self.Shift(1))
+        else:
+            self._moved(super().action_cursor_down)
+
+    def action_select_cursor(self) -> None:
+        if self.moving:
+            self.post_message(self.Drop())
+        else:
+            super().action_select_cursor()
+
+    def on_blur(self) -> None:
+        if self.moving:
+            self.post_message(self.Drop())
 
 
 class HadesApp(App[None]):
@@ -103,6 +135,7 @@ class HadesApp(App[None]):
         self._last_playback_error: str | None = None
         self._player_thread = ThreadPoolExecutor(max_workers=1, thread_name_prefix="player")
         self._poll: Future[PlayerState] | None = None
+        self._grab: tuple[int, int, bool] | None = None  # track ID, start position, dirty before
 
     # ------------------------------------------------------------------ layout
 
@@ -161,13 +194,15 @@ class HadesApp(App[None]):
                 notes += track_violations(t, pl.spec)
             elif not t.available:
                 notes.append("file unavailable")
-            marker = "▶" if t.id == self.playing_id else " "
+            grabbed = self._grab is not None and t.id == self._grab[0]
+            marker = "⇅" if grabbed else ("▶" if t.id == self.playing_id else " ")
             mark = ("●", "bold magenta") if t.id in pl.marked else (" ", "")
             bpm = "–" if t.bpm is None else f"{t.bpm:.0f}" + ("" if t.bpm_reliable else "?")
             key = "–" if t.camelot is None else t.camelot + ("" if t.key_reliable else "?")
             time = fmt_duration(t.duration) if t.duration else "–"
             added = t.created_date.isoformat() if t.created_date else "–"
-            style = "bold green" if t.id == self.playing_id else ("red" if not t.available else "")
+            style = "bold yellow" if grabbed else "bold green" if t.id == self.playing_id \
+                else ("red" if not t.available else "")
             table.add_row(
                 Text.assemble((marker, style), mark, (str(pos), style)), str(t.id), _fit(t.display, title_w, style),
                 bpm, key, time, added, _fit(", ".join(notes), 26, "yellow"), key=str(t.id))
@@ -189,6 +224,7 @@ class HadesApp(App[None]):
         if violations:
             text.append("\n⚠ " + "; ".join(violations), style="bold yellow")
         self.query_one("#stats", Static).update(text)
+        self.query_one("#help", Static).update(GRAB_HELP if self._grab else HELP_KEYS)
         self._render_player()
 
     def _render_player(self) -> None:
@@ -258,6 +294,57 @@ class HadesApp(App[None]):
             return
         self.playlist.toggle_mark(self.playlist.entries[table.cursor_row].track.id)
         self.refresh_view()
+
+    # ------------------------------------------------------------------ moving tracks
+
+    def action_toggle_grab(self) -> None:
+        if self._grab is not None:
+            self._end_grab(cancel=False)
+            return
+        table = self.query_one(PlaylistTable)
+        if not 0 <= table.cursor_row < len(self.playlist):
+            return
+        track_id = self.playlist.entries[table.cursor_row].track.id
+        self._grab = (track_id, table.cursor_row + 1, self.playlist.dirty)
+        table.moving = True
+        self.refresh_view(focus_track=track_id)
+
+    def action_cancel_grab(self) -> None:
+        if self._grab is None:
+            raise SkipAction()
+        self._end_grab(cancel=True)
+
+    def on_playlist_table_shift(self, event: PlaylistTable.Shift) -> None:
+        if self._grab is None:
+            return
+        track_id = self._grab[0]
+        pos = self.playlist.position_of(track_id)
+        if pos is None:  # the playlist was replaced meanwhile
+            self._end_grab(cancel=False)
+            return
+        if 1 <= pos + event.delta <= len(self.playlist):
+            self.playlist.move(track_id, pos + event.delta)
+        self.refresh_view(focus_track=track_id)
+
+    def on_playlist_table_drop(self, event: PlaylistTable.Drop) -> None:
+        if self._grab is not None:
+            self._end_grab(cancel=False)
+
+    def _end_grab(self, cancel: bool) -> None:
+        assert self._grab is not None
+        track_id, start, was_dirty = self._grab
+        self._grab = None
+        self.query_one(PlaylistTable).moving = False
+        pos = self.playlist.position_of(track_id)
+        if pos is None:
+            self.refresh_view()
+            return
+        if cancel or pos == start:  # back where it was: undo the dirty flag too
+            self.playlist.move(track_id, min(start, len(self.playlist)))
+            self.playlist.dirty = was_dirty
+        else:
+            self.log_line(f"Moved {track_id} to position {pos}.")
+        self.refresh_view(focus_track=track_id)
 
     def _poll_player(self) -> None:
         if self._poll is not None and not self._poll.done():
